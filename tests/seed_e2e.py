@@ -4,7 +4,6 @@ import asyncio
 import os
 
 from sqlalchemy import delete, select, update
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.auth.factors import cipher
@@ -12,13 +11,13 @@ from app.auth.models import Invitation, Membership, Organization, RateBucket, Se
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest
 from app.config import Settings
+from app.database import require_test_database
 from app.stores.models import Register, Store
 
 
 async def main():
     url = os.environ["AUTH_TEST_DATABASE_URL"]
-    if not make_url(url).database.endswith("_test"):
-        raise RuntimeError("A dedicated _test database is required")
+    url = require_test_database(url)
     engine = create_async_engine(url)
     async with async_sessionmaker(engine)() as db, db.begin():
         user = await db.scalar(select(User).where(User.email == "browser@example.com"))

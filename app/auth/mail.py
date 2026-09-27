@@ -74,7 +74,9 @@ async def deliver_one(db_factory, settings, sender=send):
             await asyncio.to_thread(sender, settings, payload)
         except Exception as error:
             # Provider adapters sanitize diagnostics; never log recipients or message bodies.
-            logger.warning("Identity email delivery failed (%s); retry scheduled", error)
+            logger.warning(
+                "Identity email delivery failed (%s); retry scheduled", type(error).__name__
+            )
             row.attempts += 1
             row.next_attempt = now() + timedelta(seconds=min(3600, 30 * 2 ** min(row.attempts, 7)))
         else:
@@ -89,20 +91,36 @@ async def main():
         return
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, stop.set)
-    engine = create_async_engine(settings.database_url.get_secret_value(), hide_parameters=True)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    engine = create_async_engine(
+        settings.database_url.get_secret_value(),
+        hide_parameters=True,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"timeout": 5, "command_timeout": 60},
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         while not stop.is_set():
-            if not await deliver_one(factory, settings):
+            try:
+                delivered = await deliver_one(factory, settings)
+            except Exception:
+                logger.warning("Mail database unavailable; retry scheduled")
+                delivered = False
+            if not delivered:
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=2)
                 except TimeoutError:
                     pass
     finally:
         await engine.dispose()
-        loop.remove_signal_handler(signal.SIGTERM)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     asyncio.run(main())

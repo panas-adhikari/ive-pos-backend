@@ -2,6 +2,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -28,6 +29,9 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(160))
     sku: Mapped[str] = mapped_column(String(60))
     barcode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    stock_unit: Mapped[str] = mapped_column(String(10), default="piece")
+    presets: Mapped[list] = mapped_column(JSON, default=list)
     price_minor: Mapped[int] = mapped_column(Integer)
     cost_minor: Mapped[int] = mapped_column(Integer, default=0)
     low_stock_threshold: Mapped[int] = mapped_column(Integer, default=5)
@@ -106,5 +110,9 @@ class SaleLine(Base):
     name: Mapped[str] = mapped_column(String(160))
     sku: Mapped[str] = mapped_column(String(60))
     quantity: Mapped[int] = mapped_column(Integer)
+    stock_quantity: Mapped[int] = mapped_column(Integer, default=1)
+    unit_label: Mapped[str] = mapped_column(String(80), default="each")
+    line_total_minor: Mapped[int] = mapped_column(Integer, default=0)
+    line_cost_minor: Mapped[int] = mapped_column(Integer, default=0)
     unit_price_minor: Mapped[int] = mapped_column(Integer)
     unit_cost_minor: Mapped[int] = mapped_column(Integer)

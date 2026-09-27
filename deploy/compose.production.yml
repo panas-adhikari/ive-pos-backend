@@ -1,0 +1,167 @@
+# Standalone file: never merge this with the development Compose file.
+name: ive-production
+x-app: &app
+  image: ${APP_IMAGE:-ive-pos-api:production}
+  build:
+    context: ..
+  environment:
+    APP_ENV: production
+    RUN_DELETION_WORKER: "false"
+    PORT: "8000"
+    DATABASE_URL: ${DATABASE_URL:?Set the application PostgreSQL URL}
+    AUTH_SECRET: ${AUTH_SECRET:?Generate a production authentication secret}
+    IDENTITY_ENCRYPTION_KEY: ${IDENTITY_ENCRYPTION_KEY:?Generate and independently save the encryption key}
+    PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the HTTPS frontend origin}
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.30.90.2}
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+    DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+    GEOCODER_URL: ${GEOCODER_URL:-https://nominatim.openstreetmap.org/search}
+    EMAIL_PROVIDER: ${EMAIL_PROVIDER:-smtp}
+    BREVO_API_KEY: ${BREVO_API_KEY:-}
+    EMAIL_FROM: ${EMAIL_FROM:-}
+    EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-}
+    EMAIL_OPERATIONS_FROM: ${EMAIL_OPERATIONS_FROM:-}
+    EMAIL_OPERATIONS_FROM_NAME: ${EMAIL_OPERATIONS_FROM_NAME:-}
+    SMTP_HOST: ${SMTP_HOST:-}
+    SMTP_PORT: ${SMTP_PORT:-587}
+    SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+    SMTP_USERNAME: ${SMTP_USERNAME:-}
+    SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    SMTP_STARTTLS: "true"
+  restart: unless-stopped
+  stop_grace_period: 60s
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  networks: [database, outbound]
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set a unique production database name}
+      POSTGRES_USER: ${POSTGRES_USER:?Set the database administrator role}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set the database administrator password}
+      APP_DATABASE_USER: ${APP_DATABASE_USER:?Set the non-superuser application role}
+      APP_DATABASE_PASSWORD: ${APP_DATABASE_PASSWORD:?Set the application password}
+    volumes:
+      - production_postgres_data:/var/lib/postgresql/data
+      - ./init-production.sh:/docker-entrypoint-initdb.d/10-production.sh:ro
+    networks: [database]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  migrate:
+    <<: *app
+    profiles: [tools]
+    command: [alembic, upgrade, head]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      database:
+      outbound:
+      proxy:
+        ipv4_address: ${API_PROXY_IP:-172.30.90.3}
+        aliases: [api-proxy]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
+  mail-worker:
+    <<: *app
+    command: [python, -m, app.auth.mail]
+    depends_on:
+      db:
+        condition: service_healthy
+    # Email is optional. Exit 0 when it is unconfigured without a restart loop.
+    restart: on-failure
+
+  maintenance-worker:
+    <<: *app
+    command: [python, -m, app.maintenance]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  proxy:
+    image: ${CADDY_IMAGE:-caddy:2-alpine}
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set api.domain}
+      APP_DOMAIN: ${APP_DOMAIN:?Set app.domain}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - production_caddy_data:/data
+      - production_caddy_config:/config
+      - ${FRONTEND_DIST_DIR:-./frontend-dist}:/srv:ro
+    networks:
+      proxy:
+        ipv4_address: ${PROXY_IP:-172.30.90.2}
+      outbound:
+    restart: unless-stopped
+    logging: *logging
+
+  backup:
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    environment:
+      PGHOST: db
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${APP_DATABASE_USER}
+      PGPASSWORD: ${APP_DATABASE_PASSWORD}
+      PGCONNECT_TIMEOUT: "10"
+    env_file: ${BACKUP_ENV_FILE:?Set the absolute path to your backup env file}
+    volumes:
+      - ./backup.sh:/scripts/backup.sh:ro
+    tmpfs: [/work, /root/.cache]
+    networks: [database, outbound]
+    command: [bash, /scripts/backup.sh]
+    logging: *logging
+
+networks:
+  database:
+    internal: true
+  proxy:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PROXY_SUBNET:-172.30.90.0/24}
+  outbound:
+
+volumes:
+  production_postgres_data:
+    external: true
+    name: ive_production_postgres_data
+  production_caddy_data:
+    external: true
+    name: ive_production_caddy_data
+  production_caddy_config:
+    external: true
+    name: ive_production_caddy_config

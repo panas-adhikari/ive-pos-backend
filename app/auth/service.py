@@ -50,7 +50,7 @@ def audit(
 
 async def throttle(request: Request, category: str, account: str | None = None):
     settings = request.app.state.settings
-    # Do not trust arbitrary X-Forwarded-For. Uvicorn proxy parsing is disabled.
+    # Uvicorn accepts forwarding headers only from explicitly configured proxy peers.
     peer = request.client.host if request.client else "unknown"
     window = int(now().timestamp()) // 900
     limits = [(f"{category}:ip:{peer}", 30 if category in {"login", "email"} else 120)]

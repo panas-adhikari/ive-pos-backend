@@ -59,4 +59,4 @@ async def deletion_worker(session_factory) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Scheduled organization deletion pass failed; retrying later")
+            logger.warning("Scheduled organization deletion pass failed; retrying later")

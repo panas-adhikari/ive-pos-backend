@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.middleware.cors import CORSMiddleware
 
 from app.auth.identity_routes import router as identity_router
 from app.auth.invitations import router as invitations_router
@@ -39,6 +40,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             config.database_url.get_secret_value(),
             pool_pre_ping=True,
             pool_timeout=3,
+            pool_size=config.db_pool_size,
+            max_overflow=config.db_max_overflow,
+            pool_recycle=300,
             hide_parameters=True,
             connect_args={
                 "timeout": 3,
@@ -47,7 +51,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
         app.state.db = async_sessionmaker(engine, expire_on_commit=False)
-        app.state.deletion_worker = asyncio.create_task(deletion_worker(app.state.db))
+        app.state.deletion_worker = (
+            asyncio.create_task(deletion_worker(app.state.db))
+            if config.run_deletion_worker
+            else None
+        )
 
         async def check_database() -> None:
             async with engine.connect() as connection:
@@ -57,11 +65,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            app.state.deletion_worker.cancel()
-            try:
-                await app.state.deletion_worker
-            except asyncio.CancelledError:
-                pass
+            if app.state.deletion_worker is not None:
+                app.state.deletion_worker.cancel()
+                try:
+                    await app.state.deletion_worker
+                except asyncio.CancelledError:
+                    pass
             await engine.dispose()
 
     app = FastAPI(
@@ -74,6 +83,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.add_middleware(SecurityMiddleware, settings_getter=lambda: app.state.settings)
+
+    # PUBLIC_ORIGIN is also the single allowed CSRF origin and email-link destination.
+    # Resolve during a request so importing the app never needs deployment secrets.
+    class ConfiguredCORS:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return await self.app(scope, receive, send)
+            cors = CORSMiddleware(
+                self.app,
+                allow_origins=[scope["app"].state.settings.public_origin],
+                allow_credentials=True,
+                allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                allow_headers=["Content-Type", "X-POS-CSRF"],
+            )
+            await cors(scope, receive, send)
+
+    app.add_middleware(ConfiguredCORS)
     app.include_router(router)
     app.include_router(identity_router)
     app.include_router(invitations_router)

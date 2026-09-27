@@ -2,7 +2,9 @@ import os
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from app.database import check_database_environment, database_url
 
 
 class Settings(BaseModel):
@@ -26,6 +28,15 @@ class Settings(BaseModel):
     smtp_password: SecretStr | None = None
     smtp_from: str = "noreply@localhost"
     smtp_starttls: bool = True
+    db_pool_size: int = Field(default=5, ge=1, le=100)
+    db_max_overflow: int = Field(default=5, ge=0, le=100)
+    run_deletion_worker: bool = True
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value):
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        return database_url(raw)
 
     @property
     def email_enabled(self) -> bool:
@@ -48,6 +59,8 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_security(self):
+        if self.auth_secret.get_secret_value().startswith("REPLACE_"):
+            raise ValueError("Replace the example AUTH_SECRET with a generated secret")
         origin = urlsplit(self.public_origin)
         if (
             not origin.hostname
@@ -75,8 +88,7 @@ class Settings(BaseModel):
                 and origin.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
             ):
                 raise ValueError("HTTPS is required except for explicit localhost development")
-        if not self.database_url.get_secret_value().startswith("postgresql+asyncpg://"):
-            raise ValueError("An async PostgreSQL DATABASE_URL is required")
+        check_database_environment(self.database_url.get_secret_value(), self.environment)
         if self.identity_encryption_key:
             from cryptography.fernet import Fernet
 
@@ -132,4 +144,7 @@ class Settings(BaseModel):
             smtp_password=os.environ.get("SMTP_PASSWORD") or None,
             smtp_from=os.environ.get("SMTP_FROM", "noreply@localhost"),
             smtp_starttls=os.environ.get("SMTP_STARTTLS", "true").lower() == "true",
+            db_pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+            db_max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "5")),
+            run_deletion_worker=os.environ.get("RUN_DELETION_WORKER", "true").lower() == "true",
         )

@@ -1,0 +1,3 @@
+FROM postgres:17-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends restic ca-certificates openssh-client \
+    && rm -rf /var/lib/apt/lists/*

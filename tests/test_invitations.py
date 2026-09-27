@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 
 from app.auth.factors import cipher
 from app.auth.models import Invitation, MailOutbox, Membership, Organization, User
-from app.auth.security import digest, now
+from app.auth.security import digest, now, verify_password
 from tests.test_auth import PASSWORD
 from tests.test_auth import anyio_backend as anyio_backend
 from tests.test_auth import setup as setup
@@ -128,7 +128,12 @@ async def test_acceptance_rechecks_limits_and_inviter(configured):
 @pytest.mark.anyio
 async def test_platform_owner_onboarding(configured):
     app, client, _ = configured
-    body = {"name": "Invited business", "owner_email": "newowner@example.com", "phone": "123"}
+    body = {
+        "name": "Invited business",
+        "owner_email": "newowner@example.com",
+        "phone": "123",
+        "owner_temporary_password": "temporary owner password for test",
+    }
     assert (await client.post("/api/v1/platform/organizations", json=body)).status_code == 403
     async with app.state.db() as db, db.begin():
         await db.execute(
@@ -139,15 +144,16 @@ async def test_platform_owner_onboarding(configured):
     response = await client.post("/api/v1/platform/organizations", json=body)
     assert response.status_code == 201, response.text
     org_id = response.json()["id"]
-    assert (await accept(client, await link(app, body["owner_email"]))).status_code == 204
     async with app.state.db() as db:
         member = await db.scalar(
             select(Membership).where(Membership.organization_id == UUID(org_id))
         )
         assert member.roles == ["owner"] and "employees.manage" in member.permissions
-        assert (await db.get(User, member.user_id)).platform_role == "none"
+        user = await db.get(User, member.user_id)
+        assert user.platform_role == "none" and user.must_change_password
+        assert verify_password(user.password_hash, body["owner_temporary_password"])
     listing = await client.get(f"/api/v1/platform/organizations/{org_id}/invitations")
-    assert listing.json()[0]["status"] == "accepted"
+    assert listing.json() == []
 
 
 @pytest.mark.anyio
@@ -215,13 +221,16 @@ async def test_legacy_unclaimed_owner_and_email_rollback(configured, monkeypatch
     def unavailable(*args, **kwargs):
         raise RuntimeError("outbox failure")
 
+    async with app.state.db() as db, db.begin():
+        pending = Organization(name="Rollback invitation", contact_email="rollback@example.com")
+        db.add(pending)
+        await db.flush()
+        pending_id = pending.id
     monkeypatch.setattr(invitations, "queue_mail", unavailable)
     with pytest.raises(RuntimeError, match="outbox failure"):
-        await client.post(
-            "/api/v1/platform/organizations",
-            json={"name": "Rolled back", "owner_email": "rollback@example.com", "phone": "123"},
-        )
+        await client.post(f"/api/v1/platform/organizations/{pending_id}/invitations", json={})
     async with app.state.db() as db:
         assert (
-            await db.scalar(select(Organization).where(Organization.name == "Rolled back")) is None
+            await db.scalar(select(Invitation.id).where(Invitation.organization_id == pending_id))
+            is None
         )

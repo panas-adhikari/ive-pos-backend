@@ -35,8 +35,7 @@ class SecurityMiddleware:
                 return await JSONResponse({"detail": "Request origin rejected"}, 403)(
                     scope, receive, secure_send
                 )
-            # CORS is intentionally disabled. Another origin cannot send this header
-            # through a browser without a successful preflight.
+            # Only PUBLIC_ORIGIN may pass credentialed CORS and this CSRF check.
             if headers.get(b"content-type", b"").split(b";")[0].strip() != b"application/json":
                 return await JSONResponse({"detail": "JSON required"}, 415)(
                     scope, receive, secure_send

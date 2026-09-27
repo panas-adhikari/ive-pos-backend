@@ -19,6 +19,14 @@ if [[ -f "$BACKEND_DIR/.env" ]]; then
   set +a
 fi
 
+if [[ "${APP_ENV:-development}" != development ]]; then
+  printf 'This launcher is for local development only. Use deploy/compose.production.yml.\n' >&2
+  exit 1
+fi
+if [[ -n "${DATABASE_URL:-}" && "${1:-}" != --container ]]; then
+  "$BACKEND_DIR/venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); from app.database import check_database_environment; import os; check_database_environment(os.environ["DATABASE_URL"], "development")' "$BACKEND_DIR"
+fi
+
 POSTGRES_DB="${POSTGRES_DB:-retail_pos}"
 POSTGRES_USER="${POSTGRES_USER:-retail_dev}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-local_development_only}"

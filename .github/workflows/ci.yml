@@ -1,0 +1,35 @@
+name: Backend checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: ive_ci_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: disposable-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test -d ive_ci_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APP_ENV: development
+      DATABASE_URL: postgresql://test:disposable-ci-only@127.0.0.1:5432/ive_ci_test
+      AUTH_TEST_DATABASE_URL: postgresql://test:disposable-ci-only@127.0.0.1:5432/ive_ci_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: alembic upgrade head
+      - run: pytest -q
+      - run: docker build -t ive-pos-api:ci .

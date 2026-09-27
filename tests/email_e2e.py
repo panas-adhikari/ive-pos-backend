@@ -6,18 +6,19 @@ import os
 import sys
 
 from sqlalchemy import select
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.auth.factors import cipher
 from app.auth.models import MailOutbox
 from app.config import Settings
+from app.database import require_test_database
 
 
 async def main():
     settings = Settings.from_environment()
     url = settings.database_url.get_secret_value()
-    if not make_url(url).database.endswith("_test") or url != os.environ["AUTH_TEST_DATABASE_URL"]:
+    require_test_database(url)
+    if url != os.environ["AUTH_TEST_DATABASE_URL"]:
         raise RuntimeError("Only a dedicated test database may be inspected")
     engine = create_async_engine(url)
     try:

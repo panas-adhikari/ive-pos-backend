@@ -19,6 +19,7 @@ from app.auth.models import (
 )
 from app.auth.security import PASSWORD_HASHER, digest, now, rate_key
 from app.config import Settings
+from app.database import require_test_database
 from app.main import create_app
 
 PASSWORD = "correct horse local retail battery"
@@ -37,10 +38,8 @@ async def setup():
     url = os.environ.get("AUTH_TEST_DATABASE_URL")
     if not url:
         pytest.skip("Set AUTH_TEST_DATABASE_URL to a migrated dedicated PostgreSQL test database")
-    from sqlalchemy.engine import make_url
 
-    if not make_url(url).database.endswith("_test"):
-        raise RuntimeError("Refusing to truncate a database without the _test suffix")
+    url = require_test_database(url)
     settings = Settings(
         database_url=url,
         auth_secret="integration-test-secret-at-least-32-characters",
@@ -106,7 +105,8 @@ async def test_login_cookies_and_no_raw_secrets_in_database(setup):
         assert "Path=/" in cookie and "Domain=" not in cookie and "__Host-" in cookie
     info = (await me(client)).json()
     assert info["email"] == "owner0@example.com"
-    assert "password" not in str(info)
+    assert not {"password", "password_hash", "mfa_secret", "recovery_hashes"} & info.keys()
+    assert PASSWORD not in str(info)
     async with app.state.db() as db:
         session = await db.get(Session, UUID(info["session_id"]))
         assert session.access_hash == digest(client.cookies["__Host-pos_access"])

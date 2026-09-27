@@ -1,0 +1,10 @@
+[Unit]
+Description=Ive PostgreSQL encrypted external backup
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ive/backend
+ExecStart=/usr/bin/docker compose --env-file /etc/ive/production.env -f deploy/compose.production.yml run --rm --no-deps backup
+TimeoutStartSec=7200

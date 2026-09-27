@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import Field, field_validator, model_validator
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 
 from app.auth import service
 from app.auth.models import Organization
@@ -21,10 +21,19 @@ from app.stores.routes import Input, record
 router = APIRouter(prefix="/api/v1/organizations/{organization_id}/operations", tags=["Operations"])
 
 
+class PresetInput(Input):
+    name: str = Field(min_length=1, max_length=60)
+    quantity: int = Field(ge=1, le=1_000_000)
+    price_minor: int = Field(ge=0, le=1_000_000_000)
+
+
 class ProductInput(Input):
     name: str = Field(min_length=1, max_length=160)
     sku: str = Field(min_length=1, max_length=60)
     barcode: str | None = Field(default=None, max_length=80)
+    category: str | None = Field(default=None, max_length=80)
+    stock_unit: Literal["piece", "gram"] = "piece"
+    presets: list[PresetInput] = Field(default_factory=list, max_length=8)
     price_minor: int = Field(ge=0, le=1_000_000_000)
     cost_minor: int = Field(default=0, ge=0, le=1_000_000_000)
     low_stock_threshold: int = Field(default=5, ge=0, le=1_000_000)
@@ -34,10 +43,17 @@ class ProductInput(Input):
     def normalize_sku(cls, value):
         return value.strip().upper() if isinstance(value, str) else value
 
+    @model_validator(mode="after")
+    def valid_presets(self):
+        if len({preset.name.casefold() for preset in self.presets}) != len(self.presets):
+            raise ValueError("Preset names must be unique")
+        return self
+
 
 class StockInput(Input):
     product_id: UUID
     quantity: int = Field(ge=1, le=1_000_000)
+    preset_index: int | None = Field(default=None, ge=0, le=7)
     kind: Literal["opening", "receipt"] = "receipt"
     note: str = Field(default="", max_length=300)
 
@@ -50,6 +66,14 @@ class CustomerInput(Input):
 class CartLine(Input):
     product_id: UUID
     quantity: int = Field(ge=1, le=10_000)
+    preset_index: int | None = Field(default=None, ge=0, le=7)
+    grams: int | None = Field(default=None, ge=1, le=1_000_000)
+
+    @model_validator(mode="after")
+    def valid_unit(self):
+        if self.preset_index is not None and self.grams is not None:
+            raise ValueError("Choose a preset or a weight")
+        return self
 
 
 class CheckoutInput(Input):
@@ -64,9 +88,55 @@ class CheckoutInput(Input):
     def valid_cart(self):
         if (self.customer_type == "daily") != (self.customer_id is not None):
             raise ValueError("Daily sales require a customer; walk-in sales do not")
-        if len({line.product_id for line in self.lines}) != len(self.lines):
-            raise ValueError("Combine duplicate products into one cart line")
+        variants = {(line.product_id, line.preset_index, line.grams) for line in self.lines}
+        if len(variants) != len(self.lines):
+            raise ValueError("Combine duplicate items into one cart line")
         return self
+
+
+class BillEditLine(CartLine):
+    line_id: UUID | None = None
+    unit_price_minor: int | None = Field(default=None, ge=0, le=1_000_000_000)
+
+
+class BillEditInput(Input):
+    customer_type: Literal["walkin", "daily"]
+    customer_id: UUID | None = None
+    lines: list[BillEditLine] = Field(min_length=1, max_length=100)
+    cash_received_minor: int = Field(ge=0, le=2_000_000_000)
+
+    @model_validator(mode="after")
+    def valid_bill(self):
+        if (self.customer_type == "daily") != (self.customer_id is not None):
+            raise ValueError("Daily sales require a customer; walk-in sales do not")
+        ids = [line.line_id for line in self.lines if line.line_id is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Each existing bill line can appear only once")
+        return self
+
+
+def priced_line(product: Product, line: CartLine):
+    """Return stock used, unit price, line total, cost, and receipt unit label."""
+    if line.preset_index is not None:
+        if line.preset_index >= len(product.presets):
+            raise HTTPException(422, "Choose an available preset")
+        preset = product.presets[line.preset_index]
+        stock_quantity = preset["quantity"] * line.quantity
+        unit_price = preset["price_minor"]
+        label = preset["name"]
+    elif line.grams is not None:
+        if product.stock_unit != "gram":
+            raise HTTPException(422, "Custom weight is only available for weighted items")
+        stock_quantity = line.grams * line.quantity
+        unit_price = (product.price_minor * line.grams + 500) // 1000
+        label = f"{line.grams} g"
+    else:
+        stock_quantity = line.quantity * (1000 if product.stock_unit == "gram" else 1)
+        unit_price = product.price_minor
+        label = "kg" if product.stock_unit == "gram" else "each"
+    divisor = 1000 if product.stock_unit == "gram" else 1
+    cost = (product.cost_minor * stock_quantity + divisor // 2) // divisor
+    return stock_quantity, unit_price, unit_price * line.quantity, cost, label
 
 
 async def authorize(db, request, organization_id, permission, *, store_id=None, write=False):
@@ -107,6 +177,7 @@ async def receipt(db, sale):
         "receipt_footer": store.receipt_footer,
         "currency": sale.currency,
         "customer_type": sale.customer_type,
+        "customer_id": sale.customer_id,
         "customer": customer.name if customer else None,
         "payment_method": sale.payment_method,
         "status": sale.status,
@@ -116,11 +187,14 @@ async def receipt(db, sale):
         "lines": [
             {
                 "product_id": line.product_id,
+                "id": line.id,
                 "name": line.name,
                 "sku": line.sku,
                 "quantity": line.quantity,
+                "stock_quantity": line.stock_quantity,
+                "unit_label": line.unit_label,
                 "unit_price_minor": line.unit_price_minor,
-                "line_total_minor": line.quantity * line.unit_price_minor,
+                "line_total_minor": line.line_total_minor,
             }
             for line in lines
         ],
@@ -177,7 +251,7 @@ async def products(organization_id: UUID, store_id: UUID, request: Request, quer
                 StockBalance,
                 (StockBalance.product_id == Product.id) & (StockBalance.store_id == store_id),
             )
-            .where(Product.organization_id == organization_id)
+            .where(Product.organization_id == organization_id, Product.active.is_(True))
             .order_by(Product.name)
             .limit(100)
         )
@@ -226,6 +300,84 @@ async def create_product(organization_id: UUID, body: ProductInput, request: Req
         return record(product)
 
 
+@router.delete("/products/{product_id}")
+async def delete_product(organization_id: UUID, product_id: UUID, request: Request):
+    async with request.app.state.db() as db, db.begin():
+        _, member = await authorize(db, request, organization_id, "catalog.manage", write=True)
+        if not member.all_stores:
+            raise HTTPException(403, "Organization-wide catalog access required")
+        product = await db.scalar(
+            select(Product)
+            .where(
+                Product.id == product_id,
+                Product.organization_id == organization_id,
+                Product.active.is_(True),
+            )
+            .with_for_update()
+        )
+        if not product:
+            raise HTTPException(404, "Active item not found")
+        product.active = False
+        product.sku = f"ARCHIVED-{product.id}"
+        product.barcode = None
+        service.audit(
+            db,
+            "product.deleted",
+            *request.state.identity,
+            organization_id=organization_id,
+            target_type="products",
+            target_id=product.id,
+        )
+        return {"id": product.id, "active": False}
+
+
+@router.put("/products/{product_id}")
+async def update_product(
+    organization_id: UUID, product_id: UUID, body: ProductInput, request: Request
+):
+    async with request.app.state.db() as db, db.begin():
+        _, member = await authorize(db, request, organization_id, "catalog.manage", write=True)
+        if not member.all_stores:
+            raise HTTPException(403, "Organization-wide catalog access required")
+        product = await db.scalar(
+            select(Product)
+            .where(
+                Product.id == product_id,
+                Product.organization_id == organization_id,
+                Product.active.is_(True),
+            )
+            .with_for_update()
+        )
+        if not product:
+            raise HTTPException(404, "Active item not found")
+        if body.stock_unit != product.stock_unit:
+            raise HTTPException(422, "Stock unit cannot be changed after item creation")
+        duplicate = await db.scalar(
+            select(Product.id).where(
+                Product.organization_id == organization_id,
+                Product.id != product_id,
+                or_(
+                    Product.sku == body.sku,
+                    Product.barcode == body.barcode if body.barcode else False,
+                ),
+            )
+        )
+        if duplicate:
+            raise HTTPException(409, "SKU or barcode already exists")
+        for field, value in body.model_dump(exclude={"stock_unit"}).items():
+            setattr(product, field, value)
+        await db.flush()
+        service.audit(
+            db,
+            "product.updated",
+            *request.state.identity,
+            organization_id=organization_id,
+            target_type="products",
+            target_id=product.id,
+        )
+        return record(product)
+
+
 @router.post("/stores/{store_id}/stock", status_code=201)
 async def add_stock(organization_id: UUID, store_id: UUID, body: StockInput, request: Request):
     async with request.app.state.db() as db, db.begin():
@@ -257,14 +409,22 @@ async def add_stock(organization_id: UUID, store_id: UUID, body: StockInput, req
                 quantity=0,
             )
             db.add(balance)
-        balance.quantity += body.quantity
+        multiplier = 1
+        if body.preset_index is not None:
+            if body.preset_index >= len(product.presets):
+                raise HTTPException(422, "Choose an available preset")
+            multiplier = product.presets[body.preset_index]["quantity"]
+        added = body.quantity * multiplier
+        if added > 1_000_000_000 or balance.quantity + added > 2_000_000_000:
+            raise HTTPException(422, "Stock quantity is too large")
+        balance.quantity += added
         movement = StockMovement(
             organization_id=organization_id,
             store_id=store_id,
             product_id=product.id,
             actor_id=request.state.identity[0],
             kind=body.kind,
-            delta=body.quantity,
+            delta=added,
             note=body.note,
             created=now(),
         )
@@ -292,7 +452,7 @@ async def stock(organization_id: UUID, store_id: UUID, request: Request):
                     StockBalance,
                     (StockBalance.product_id == Product.id) & (StockBalance.store_id == store_id),
                 )
-                .where(Product.organization_id == organization_id)
+                .where(Product.organization_id == organization_id, Product.active.is_(True))
                 .order_by(Product.name)
             )
         ).all()
@@ -312,7 +472,7 @@ async def movements(organization_id: UUID, store_id: UUID, request: Request):
         await authorize(db, request, organization_id, "reports.read", store_id=store_id)
         rows = (
             await db.execute(
-                select(StockMovement, Product.name)
+                select(StockMovement, Product.name, Product.stock_unit)
                 .join(Product, Product.id == StockMovement.product_id)
                 .where(
                     StockMovement.organization_id == organization_id,
@@ -322,7 +482,10 @@ async def movements(organization_id: UUID, store_id: UUID, request: Request):
                 .limit(100)
             )
         ).all()
-        return [{**record(movement), "product_name": name} for movement, name in rows]
+        return [
+            {**record(movement), "product_name": name, "stock_unit": unit}
+            for movement, name, unit in rows
+        ]
 
 
 @router.get("/customers")
@@ -427,11 +590,18 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
             )
         }
         total = 0
+        prepared = []
+        deductions = {}
         for line in body.lines:
-            balance = balances.get(line.product_id)
-            if not balance or balance.quantity < line.quantity:
-                raise HTTPException(409, f"Insufficient stock for {products[line.product_id].name}")
-            total += products[line.product_id].price_minor * line.quantity
+            product = products[line.product_id]
+            stock_quantity, unit_price, line_total, cost, label = priced_line(product, line)
+            deductions[line.product_id] = deductions.get(line.product_id, 0) + stock_quantity
+            prepared.append((line, product, stock_quantity, unit_price, line_total, cost, label))
+            total += line_total
+        for product_id, quantity in deductions.items():
+            balance = balances.get(product_id)
+            if not balance or balance.quantity < quantity:
+                raise HTTPException(409, f"Insufficient stock for {products[product_id].name}")
         if total > 2_000_000_000:
             raise HTTPException(422, "Cart total is too large")
         if body.cash_received_minor < total:
@@ -458,9 +628,9 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
         )
         db.add(sale)
         await db.flush()
-        for line in body.lines:
-            product = products[line.product_id]
-            balances[line.product_id].quantity -= line.quantity
+        for product_id, quantity in deductions.items():
+            balances[product_id].quantity -= quantity
+        for line, product, stock_quantity, unit_price, line_total, cost, label in prepared:
             db.add(
                 SaleLine(
                     sale_id=sale.id,
@@ -468,8 +638,12 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
                     name=product.name,
                     sku=product.sku,
                     quantity=line.quantity,
-                    unit_price_minor=product.price_minor,
+                    stock_quantity=stock_quantity,
+                    unit_label=label,
+                    unit_price_minor=unit_price,
                     unit_cost_minor=product.cost_minor,
+                    line_total_minor=line_total,
+                    line_cost_minor=cost,
                 )
             )
             db.add(
@@ -479,7 +653,7 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
                     product_id=product.id,
                     actor_id=request.state.identity[0],
                     kind="sale",
-                    delta=-line.quantity,
+                    delta=-stock_quantity,
                     note="",
                     sale_id=sale.id,
                     created=sale.created,
@@ -498,18 +672,21 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
 
 
 @router.get("/stores/{store_id}/sales")
-async def sales(organization_id: UUID, store_id: UUID, request: Request):
+async def sales(
+    organization_id: UUID,
+    store_id: UUID,
+    request: Request,
+    query: str = Query(default="", max_length=50),
+):
     async with request.app.state.db() as db, db.begin():
         await authorize(db, request, organization_id, "sales.create", store_id=store_id)
-        rows = await db.scalars(
-            select(Sale)
-            .where(
-                Sale.organization_id == organization_id,
-                Sale.store_id == store_id,
-            )
-            .order_by(Sale.created.desc())
-            .limit(50)
+        statement = select(Sale).where(
+            Sale.organization_id == organization_id,
+            Sale.store_id == store_id,
         )
+        if query.strip():
+            statement = statement.where(Sale.receipt_number.ilike(f"%{query.strip()}%"))
+        rows = await db.scalars(statement.order_by(Sale.created.desc()).limit(50))
         return [record(row) for row in rows]
 
 
@@ -526,6 +703,188 @@ async def sale_receipt(organization_id: UUID, store_id: UUID, sale_id: UUID, req
         )
         if not sale:
             raise HTTPException(404, "Sale not found")
+        return await receipt(db, sale)
+
+
+@router.put("/stores/{store_id}/sales/{sale_id}")
+async def edit_sale(
+    organization_id: UUID, store_id: UUID, sale_id: UUID, body: BillEditInput, request: Request
+):
+    async with request.app.state.db() as db, db.begin():
+        await authorize(db, request, organization_id, "sales.create", store_id=store_id, write=True)
+        await store_row(db, organization_id, store_id, lock=True)
+        sale = await db.scalar(
+            select(Sale)
+            .where(
+                Sale.id == sale_id,
+                Sale.organization_id == organization_id,
+                Sale.store_id == store_id,
+            )
+            .with_for_update()
+        )
+        if not sale:
+            raise HTTPException(404, "Sale not found")
+        if sale.status != "paid" or sale.payment_method != "cash":
+            raise HTTPException(409, "Only paid cash bills can be edited")
+        if body.customer_id and not await db.scalar(
+            select(Customer.id).where(
+                Customer.id == body.customer_id, Customer.organization_id == organization_id
+            )
+        ):
+            raise HTTPException(404, "Customer not found")
+
+        previous = list(await db.scalars(select(SaleLine).where(SaleLine.sale_id == sale.id)))
+        before = {
+            "customer_type": sale.customer_type,
+            "customer_id": str(sale.customer_id) if sale.customer_id else None,
+            "total_minor": sale.total_minor,
+            "cash_received_minor": sale.cash_received_minor,
+            "lines": [
+                {
+                    "id": str(line.id),
+                    "product_id": str(line.product_id),
+                    "quantity": line.quantity,
+                    "stock_quantity": line.stock_quantity,
+                    "unit_price_minor": line.unit_price_minor,
+                }
+                for line in previous
+            ],
+        }
+        previous_by_id = {line.id: line for line in previous}
+        new_product_ids = {line.product_id for line in body.lines if line.line_id is None}
+        products = {
+            product.id: product
+            for product in await db.scalars(
+                select(Product).where(
+                    Product.organization_id == organization_id,
+                    Product.id.in_(new_product_ids),
+                    Product.active.is_(True),
+                )
+            )
+        }
+        if len(products) != len(new_product_ids):
+            raise HTTPException(409, "One or more added products are unavailable")
+
+        old_stock = {}
+        for line in previous:
+            old_stock[line.product_id] = old_stock.get(line.product_id, 0) + line.stock_quantity
+        new_stock = {}
+        prepared = []
+        total = 0
+        for entry in body.lines:
+            if entry.line_id is not None:
+                line = previous_by_id.get(entry.line_id)
+                if not line or line.product_id != entry.product_id:
+                    raise HTTPException(422, "Bill line does not belong to this sale")
+                stock_per_unit = line.stock_quantity // line.quantity
+                original_quantity = line.quantity
+                original_cost = line.line_cost_minor
+                line.quantity = entry.quantity
+                line.stock_quantity = stock_per_unit * entry.quantity
+                if entry.unit_price_minor is not None:
+                    line.unit_price_minor = entry.unit_price_minor
+                line.line_total_minor = line.unit_price_minor * entry.quantity
+                line.line_cost_minor = (
+                    original_cost * entry.quantity + original_quantity // 2
+                ) // original_quantity
+                prepared.append(line)
+            else:
+                product = products[entry.product_id]
+                stock_quantity, unit_price, line_total, cost, label = priced_line(product, entry)
+                if entry.unit_price_minor is not None:
+                    unit_price = entry.unit_price_minor
+                    line_total = unit_price * entry.quantity
+                line = SaleLine(
+                    sale_id=sale.id,
+                    product_id=product.id,
+                    name=product.name,
+                    sku=product.sku,
+                    quantity=entry.quantity,
+                    stock_quantity=stock_quantity,
+                    unit_label=label,
+                    unit_price_minor=unit_price,
+                    unit_cost_minor=product.cost_minor,
+                    line_total_minor=line_total,
+                    line_cost_minor=cost,
+                )
+                prepared.append(line)
+            new_stock[line.product_id] = new_stock.get(line.product_id, 0) + line.stock_quantity
+            total += line.line_total_minor
+        if total > 2_000_000_000:
+            raise HTTPException(422, "Bill total is too large")
+        if body.cash_received_minor < total:
+            raise HTTPException(422, "Cash received must cover the full bill")
+
+        product_ids = set(old_stock) | set(new_stock)
+        balances = {
+            balance.product_id: balance
+            for balance in await db.scalars(
+                select(StockBalance)
+                .where(
+                    StockBalance.store_id == store_id,
+                    StockBalance.product_id.in_(product_ids),
+                )
+                .order_by(StockBalance.product_id)
+                .with_for_update()
+            )
+        }
+        for product_id in product_ids:
+            balance = balances.get(product_id)
+            difference = old_stock.get(product_id, 0) - new_stock.get(product_id, 0)
+            if not balance or balance.quantity + difference < 0:
+                raise HTTPException(409, "Insufficient stock to save this correction")
+            if difference:
+                balance.quantity += difference
+                db.add(
+                    StockMovement(
+                        organization_id=organization_id,
+                        store_id=store_id,
+                        product_id=product_id,
+                        actor_id=request.state.identity[0],
+                        kind="sale_correction",
+                        delta=difference,
+                        note=f"Bill {sale.receipt_number} corrected",
+                        sale_id=sale.id,
+                        created=now(),
+                    )
+                )
+        kept_ids = {line.line_id for line in body.lines if line.line_id is not None}
+        await db.execute(
+            delete(SaleLine).where(SaleLine.sale_id == sale.id, SaleLine.id.not_in(kept_ids))
+        )
+        db.add_all([line for line in prepared if line.id is None])
+        sale.customer_type = body.customer_type
+        sale.customer_id = body.customer_id
+        sale.cash_received_minor = body.cash_received_minor
+        sale.total_minor = total
+        await db.flush()
+        service.audit(
+            db,
+            "sale.corrected",
+            *request.state.identity,
+            organization_id=organization_id,
+            target_type="sales",
+            target_id=sale.id,
+            changes={
+                "before": before,
+                "after": {
+                    "customer_type": sale.customer_type,
+                    "customer_id": str(sale.customer_id) if sale.customer_id else None,
+                    "total_minor": total,
+                    "cash_received_minor": body.cash_received_minor,
+                    "lines": [
+                        {
+                            "id": str(line.id),
+                            "product_id": str(line.product_id),
+                            "quantity": line.quantity,
+                            "stock_quantity": line.stock_quantity,
+                            "unit_price_minor": line.unit_price_minor,
+                        }
+                        for line in prepared
+                    ],
+                },
+            },
+        )
         return await receipt(db, sale)
 
 
@@ -561,13 +920,13 @@ async def daily_report(
         units = 0
         if ids:
             line_rows = await db.execute(
-                select(SaleLine.quantity, SaleLine.unit_cost_minor).where(
+                select(SaleLine.quantity, SaleLine.line_cost_minor).where(
                     SaleLine.sale_id.in_(ids),
                 )
             )
-            for quantity, unit_cost in line_rows:
+            for quantity, line_cost in line_rows:
                 units += quantity
-                cost += quantity * unit_cost
+                cost += line_cost
         stock_rows = (
             await db.execute(
                 select(Product, StockBalance.quantity)
@@ -596,6 +955,7 @@ async def daily_report(
                     "name": product.name,
                     "sku": product.sku,
                     "quantity": quantity or 0,
+                    "stock_unit": product.stock_unit,
                     "threshold": product.low_stock_threshold,
                 }
                 for product, quantity in stock_rows

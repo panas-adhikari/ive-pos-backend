@@ -1,9 +1,9 @@
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
-from app.auth.models import AuditEvent, Invitation, Membership, Organization, Session, User
+from app.auth.models import AuditEvent, Invitation, Membership, Organization, User
 from app.auth.security import now
 from app.stores.models import Register, Store
 from tests.test_auth import setup as setup
@@ -15,10 +15,7 @@ async def make_platform_admin(app):
     async with app.state.db() as db, db.begin():
         actor = await db.scalar(select(User).where(User.email == "owner0@example.com"))
         actor.platform_role = "super_admin"
-        actor.mfa_secret = None
-        await db.execute(
-            update(Session).where(Session.user_id == actor.id).values(step_up_expires=None)
-        )
+        # Preserve the configured fixture's actual MFA and recent step-up session.
 
 
 @pytest.mark.anyio
