@@ -1,6 +1,26 @@
 """PostgreSQL configuration shared by runtime, migrations and operator tools."""
 
+import os
+from collections.abc import Mapping
+
 from sqlalchemy.engine import make_url
+
+
+def database_provider(value: str) -> str:
+    if value not in {"postgres", "supabase"}:
+        raise ValueError("DB_PROVIDER must be postgres or supabase")
+    return value
+
+
+def database_url_from_environment(environ: Mapping[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    provider = database_provider(env.get("DB_PROVIDER", "postgres"))
+    key = "SUPABASE_DATABASE_URL" if provider == "supabase" else "DATABASE_URL"
+    if not env.get(key):
+        raise ValueError(f"{key} is required for DB_PROVIDER={provider}")
+    url = database_url(env[key])
+    check_database_environment(url, env.get("APP_ENV", "production"), provider)
+    return url
 
 
 def database_url(value: str) -> str:
@@ -20,10 +40,24 @@ def database_url(value: str) -> str:
         raise ValueError("DATABASE_URL must be a PostgreSQL URL with a database name") from None
 
 
-def check_database_environment(value: str, environment: str) -> None:
+def check_database_environment(value: str, environment: str, provider: str = "postgres") -> None:
+    database_provider(provider)
     url = make_url(database_url(value))
+    if provider == "supabase":
+        # Both direct connections and the session pooler work with asyncpg.
+        # Transaction pooling needs driver changes; do not silently select it.
+        if url.port == 6543:
+            raise ValueError("Supabase requires a direct connection or session pooler on port 5432")
+        if url.query.get("ssl") not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError("Supabase requires TLS: add sslmode=require to the database URI")
     if environment == "development":
-        if url.host not in {"localhost", "127.0.0.1", "::1", "db", "postgres"}:
+        if provider == "postgres" and url.host not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "db",
+            "postgres",
+        }:
             raise ValueError("Development must use local PostgreSQL, never a remote database")
         if url.database.endswith(("_production", "_prod")):
             raise ValueError("Development cannot use a production database")

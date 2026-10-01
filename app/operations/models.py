@@ -38,6 +38,22 @@ class Product(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class ProductPriceHistory(Base):
+    __tablename__ = "product_price_history"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), index=True)
+    product_id: Mapped[UUID] = mapped_column(ForeignKey("products.id"), index=True)
+    actor_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    old_price_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_price_minor: Mapped[int] = mapped_column(Integer)
+    old_cost_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_cost_minor: Mapped[int] = mapped_column(Integer)
+    old_presets: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    new_presets: Mapped[list] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(String(30), default="catalog_update")
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class StockBalance(Base):
     __tablename__ = "stock_balances"
     __table_args__ = (
@@ -81,7 +97,10 @@ class Sale(Base):
     __table_args__ = (
         UniqueConstraint("organization_id", "client_key"),
         UniqueConstraint("store_id", "receipt_number"),
-        CheckConstraint("total_minor >= 0 AND cash_received_minor >= total_minor"),
+        CheckConstraint(
+            "subtotal_minor >= 0 AND discount_minor >= 0 AND total_minor >= 0 "
+            "AND discount_minor <= subtotal_minor AND cash_received_minor >= total_minor"
+        ),
     )
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
     organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), index=True)
@@ -93,6 +112,10 @@ class Sale(Base):
     request_hash: Mapped[str] = mapped_column(String(64))
     receipt_number: Mapped[str] = mapped_column(String(50))
     currency: Mapped[str] = mapped_column(String(3))
+    subtotal_minor: Mapped[int] = mapped_column(Integer, default=0)
+    discount_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    discount_value: Mapped[int] = mapped_column(Integer, default=0)
+    discount_minor: Mapped[int] = mapped_column(Integer, default=0)
     total_minor: Mapped[int] = mapped_column(Integer)
     cash_received_minor: Mapped[int] = mapped_column(Integer)
     payment_method: Mapped[str] = mapped_column(String(20), default="cash")
@@ -103,7 +126,13 @@ class Sale(Base):
 
 class SaleLine(Base):
     __tablename__ = "sale_lines"
-    __table_args__ = (CheckConstraint("quantity > 0 AND unit_price_minor >= 0"),)
+    __table_args__ = (
+        CheckConstraint(
+            "quantity > 0 AND catalog_unit_price_minor >= 0 AND unit_price_minor >= 0 "
+            "AND line_subtotal_minor >= 0 AND discount_minor >= 0 "
+            "AND discount_minor <= line_subtotal_minor AND line_total_minor >= 0"
+        ),
+    )
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
     sale_id: Mapped[UUID] = mapped_column(ForeignKey("sales.id"), index=True)
     product_id: Mapped[UUID] = mapped_column(ForeignKey("products.id"))
@@ -112,6 +141,11 @@ class SaleLine(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     stock_quantity: Mapped[int] = mapped_column(Integer, default=1)
     unit_label: Mapped[str] = mapped_column(String(80), default="each")
+    catalog_unit_price_minor: Mapped[int] = mapped_column(Integer, default=0)
+    line_subtotal_minor: Mapped[int] = mapped_column(Integer, default=0)
+    discount_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    discount_value: Mapped[int] = mapped_column(Integer, default=0)
+    discount_minor: Mapped[int] = mapped_column(Integer, default=0)
     line_total_minor: Mapped[int] = mapped_column(Integer, default=0)
     line_cost_minor: Mapped[int] = mapped_column(Integer, default=0)
     unit_price_minor: Mapped[int] = mapped_column(Integer)

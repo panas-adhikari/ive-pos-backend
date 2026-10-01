@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+if [[ "${DB_PROVIDER:-postgres}" != postgres ]]; then
+  echo 'This backup job targets native PostgreSQL. Configure Supabase backups separately.' >&2
+  exit 1
+fi
 : "${RESTIC_REPOSITORY:?An external backup repository is required}"
 : "${RESTIC_PASSWORD:?Set the backup encryption secret}"
 [[ "$RESTIC_PASSWORD" != REPLACE_* && ${#RESTIC_PASSWORD} -ge 16 ]] || {

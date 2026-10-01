@@ -55,4 +55,4 @@ ROLE_PERMISSIONS = {
 }
 
 # Default store scope for role templates. Staff access can still be tailored per person.
-ROLE_DEFAULT_ALL_STORES = {"owner", "organization_admin", "administrator", "store_manager"}
+ROLE_DEFAULT_ALL_STORES = {"owner", "organization_admin", "administrator"}

@@ -2,7 +2,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.database import check_database_environment, database_url, require_test_database
+from app.database import (
+    check_database_environment,
+    database_url,
+    database_url_from_environment,
+    require_test_database,
+)
 from app.main import create_app
 
 
@@ -27,6 +32,70 @@ def test_development_and_test_database_guards(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     with pytest.raises(RuntimeError):
         require_test_database("postgresql://u:p@localhost/ive_test")
+
+
+def test_database_provider_selection_never_falls_back():
+    native = "postgresql://u:p@localhost/native"
+    hosted = "postgresql://u:p@db.example.supabase.co:5432/postgres?sslmode=require"
+    env = {"DATABASE_URL": native, "SUPABASE_DATABASE_URL": hosted}
+    assert database_url_from_environment(env) == database_url(native)
+    env.update(DB_PROVIDER="supabase", APP_ENV="development")
+    assert database_url_from_environment(env) == database_url(hosted)
+    env["DB_PROVIDER"] = "postgres"
+    assert database_url_from_environment(env) == database_url(native)
+    env["DB_PROVIDER"] = "supabase"
+    del env["SUPABASE_DATABASE_URL"]
+    with pytest.raises(ValueError, match="SUPABASE_DATABASE_URL is required"):
+        database_url_from_environment(env)
+    env["DB_PROVIDER"] = "invalid"
+    with pytest.raises(ValueError, match="DB_PROVIDER"):
+        database_url_from_environment(env)
+
+
+@pytest.mark.parametrize(
+    "uri, message",
+    [
+        ("postgresql://u:p@remote:5432/postgres", "TLS"),
+        ("postgresql://u:p@remote:5432/postgres?sslmode=disable", "TLS"),
+        ("postgresql://u:p@remote:6543/postgres?sslmode=require", "session pooler"),
+        ("postgresql://u:p@remote:5432/live_prod?sslmode=require", "production"),
+    ],
+)
+def test_supabase_configuration_guards(uri, message):
+    with pytest.raises(ValueError, match=message):
+        database_url_from_environment(
+            {"DB_PROVIDER": "supabase", "SUPABASE_DATABASE_URL": uri, "APP_ENV": "development"}
+        )
+
+
+def test_supabase_settings_and_migrations_select_same_uri(monkeypatch):
+    import runpy
+    from contextlib import nullcontext
+
+    from alembic import context
+
+    hosted = "postgresql://u:p@pooler.example.com:5432/postgres?sslmode=require"
+    monkeypatch.setenv("DB_PROVIDER", "supabase")
+    monkeypatch.setenv("SUPABASE_DATABASE_URL", hosted)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/native")
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("AUTH_SECRET", "test-only-secret-that-is-at-least-32-characters")
+    monkeypatch.setenv("PUBLIC_ORIGIN", "http://localhost:5173")
+    for key in ("SMTP_HOST", "BREVO_API_KEY", "IDENTITY_ENCRYPTION_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    settings = Settings.from_environment()
+    assert settings.db_provider == "supabase"
+    assert settings.database_url.get_secret_value() == database_url(hosted)
+    captured = {}
+    monkeypatch.setattr(context, "is_offline_mode", lambda: True)
+    monkeypatch.setattr(context, "configure", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(context, "begin_transaction", nullcontext)
+    monkeypatch.setattr(context, "run_migrations", lambda: None)
+    runpy.run_path("migrations/env.py")
+    assert captured["url"] == settings.database_url.get_secret_value()
+    # Hosted development never weakens the disposable local database test guard.
+    with pytest.raises(RuntimeError, match="local disposable"):
+        require_test_database(hosted)
 
 
 def test_cross_subdomain_cors_and_csrf():

@@ -31,6 +31,10 @@ class Access(Input):
             raise ValueError("Choose all stores or specific stores")
         if not self.all_stores and set(self.permissions) & ORGANIZATION_PERMISSIONS:
             raise ValueError("Administration requires organization-wide access")
+        if self.active and not self.all_stores and not self.store_ids and set(self.permissions) & {
+            "store.read", "inventory.manage", "sales.create", "reports.read"
+        }:
+            raise ValueError("Select at least one store for active staff")
         self.roles = sorted(set(self.roles))
         self.permissions = sorted(set(self.permissions))
         self.store_ids = sorted(set(self.store_ids))
@@ -48,6 +52,73 @@ class Create(Access):
 
 class Edit(Access):
     expected_version: int = Field(ge=1)
+
+
+class Assignment(Input):
+    store_ids: list[UUID] = Field(min_length=1, max_length=200)
+    expected_version: int = Field(ge=1)
+
+
+async def assignment_actor(db, request, organization_id):
+    await db.scalar(select(Organization).where(Organization.id == organization_id).with_for_update())
+    await service.locked_identity(request, db)
+    actor = await service.scoped_permission(db, request, organization_id, "store.read")
+    if not ({"store_manager", "store_admin"} & set(actor.roles)):
+        raise HTTPException(403, "Store manager access required")
+    return actor
+
+
+def assignable(actor, member):
+    return (
+        member.user_id != actor.user_id
+        and not member.all_stores
+        and not set(member.permissions) & ORGANIZATION_PERMISSIONS
+        and not set(member.roles) & {"owner", "organization_admin", "administrator", "store_manager", "store_admin"}
+        and (actor.all_stores or bool(set(member.store_ids) & set(actor.store_ids)))
+    )
+
+
+@router.get("/staff-assignments")
+async def assignment_directory(organization_id: UUID, request: Request):
+    async with request.app.state.db() as db, db.begin():
+        actor = await assignment_actor(db, request, organization_id)
+        rows = (await db.execute(select(Membership, User.email).join(User).where(
+            Membership.organization_id == organization_id
+        ).order_by(User.email))).all()
+        stores = list(await db.scalars(select(Store).where(
+            Store.organization_id == organization_id, Store.active.is_(True),
+            True if actor.all_stores else Store.id.in_(actor.store_ids),
+        ).order_by(Store.name)))
+        allowed = {store.id for store in stores}
+        return {
+            "stores": [{"id": s.id, "name": s.name} for s in stores],
+            "memberships": [{"id": m.id, "email": email, "version": m.version,
+                "store_ids": [s for s in m.store_ids if s in allowed]}
+                for m, email in rows if assignable(actor, m)],
+        }
+
+
+@router.put("/staff-assignments/{membership_id}")
+async def assign_staff(organization_id: UUID, membership_id: UUID, body: Assignment, request: Request):
+    async with request.app.state.db() as db, db.begin():
+        actor = await assignment_actor(db, request, organization_id)
+        member = await db.scalar(select(Membership).where(
+            Membership.id == membership_id, Membership.organization_id == organization_id
+        ).with_for_update())
+        if not member or not assignable(actor, member):
+            raise HTTPException(403, "This person's assignments require an organization administrator")
+        check_version(member, body.expected_version)
+        allowed = set(await db.scalars(select(Store.id).where(
+            Store.organization_id == organization_id, Store.active.is_(True),
+            True if actor.all_stores else Store.id.in_(actor.store_ids),
+        )))
+        if not set(body.store_ids) <= allowed:
+            raise HTTPException(403, "Choose only active stores you manage")
+        before = record(member)
+        member.store_ids = sorted((set(member.store_ids) - allowed) | set(body.store_ids))
+        member.version += 1
+        log(db, request, organization_id, "membership.stores_assigned", member, before)
+        return {"id": member.id, "version": member.version}
 
 
 async def authorize(db, request, organization_id, *, write=False):

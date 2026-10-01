@@ -23,8 +23,15 @@ if [[ "${APP_ENV:-development}" != development ]]; then
   printf 'This launcher is for local development only. Use deploy/compose.production.yml.\n' >&2
   exit 1
 fi
-if [[ -n "${DATABASE_URL:-}" && "${1:-}" != --container ]]; then
-  "$BACKEND_DIR/venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); from app.database import check_database_environment; import os; check_database_environment(os.environ["DATABASE_URL"], "development")' "$BACKEND_DIR"
+export DB_PROVIDER="${DB_PROVIDER:-postgres}"
+case "$DB_PROVIDER" in
+  postgres|supabase) ;;
+  *) printf 'DB_PROVIDER must be postgres or supabase.\n' >&2; exit 1 ;;
+esac
+export COMPOSE_PROFILES="$DB_PROVIDER"
+export APP_ENV=development
+if [[ "$DB_PROVIDER" == supabase || -n "${DATABASE_URL:-}" ]] && [[ "${1:-}" != --container ]]; then
+  "$BACKEND_DIR/venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); from app.database import database_url_from_environment; database_url_from_environment()' "$BACKEND_DIR"
 fi
 
 POSTGRES_DB="${POSTGRES_DB:-retail_pos}"
@@ -34,6 +41,10 @@ POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 API_PORT="${API_PORT:-8000}"
 AUTH_SECRET="${AUTH_SECRET:-}"
 DATABASE_URL_WAS_SET="${DATABASE_URL+x}"
+if [[ "$DB_PROVIDER" == supabase ]]; then
+  # Skip initialization and all local PostgreSQL client commands.
+  DATABASE_URL_WAS_SET=1
+fi
 
 if [[ "${1:-}" == "--container" ]]; then
   if [[ ! -f "$BACKEND_DIR/.env" ]]; then
@@ -46,7 +57,10 @@ if [[ "${1:-}" == "--container" ]]; then
   fi
 
   cd "$PROJECT_ROOT"
-  compose_services=(db api)
+  compose_services=(api)
+  if [[ "$DB_PROVIDER" == postgres ]]; then
+    compose_services=(db api)
+  fi
   email_provider="${EMAIL_PROVIDER:-}"
   if [[ -z "$email_provider" ]]; then
     if [[ -n "${BREVO_API_KEY:-}" ]]; then
@@ -83,7 +97,7 @@ if [[ -z "$AUTH_SECRET" || ${#AUTH_SECRET} -lt 32 ]]; then
   exit 1
 fi
 
-if ! command -v pg_isready >/dev/null 2>&1; then
+if [[ -z "$DATABASE_URL_WAS_SET" ]] && ! command -v pg_isready >/dev/null 2>&1; then
   printf 'PostgreSQL client tools are required for local mode (pg_isready was not found).\n' >&2
   exit 1
 fi

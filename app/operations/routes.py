@@ -12,9 +12,17 @@ from pydantic import Field, field_validator, model_validator
 from sqlalchemy import delete, or_, select
 
 from app.auth import service
-from app.auth.models import Organization
+from app.auth.models import Organization, User
 from app.auth.security import now
-from app.operations.models import Customer, Product, Sale, SaleLine, StockBalance, StockMovement
+from app.operations.models import (
+    Customer,
+    Product,
+    ProductPriceHistory,
+    Sale,
+    SaleLine,
+    StockBalance,
+    StockMovement,
+)
 from app.stores.models import Register, Store
 from app.stores.routes import Input, record
 
@@ -68,11 +76,15 @@ class CartLine(Input):
     quantity: int = Field(ge=1, le=10_000)
     preset_index: int | None = Field(default=None, ge=0, le=7)
     grams: int | None = Field(default=None, ge=1, le=1_000_000)
+    unit_price_minor: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    discount_type: Literal["amount", "percentage"] | None = None
+    discount_value: int = Field(default=0, ge=0, le=2_000_000_000)
 
     @model_validator(mode="after")
     def valid_unit(self):
         if self.preset_index is not None and self.grams is not None:
             raise ValueError("Choose a preset or a weight")
+        validate_discount(self.discount_type, self.discount_value)
         return self
 
 
@@ -83,6 +95,8 @@ class CheckoutInput(Input):
     customer_id: UUID | None = None
     lines: list[CartLine] = Field(min_length=1, max_length=100)
     cash_received_minor: int = Field(ge=0, le=2_000_000_000)
+    discount_type: Literal["amount", "percentage"] | None = None
+    discount_value: int = Field(default=0, ge=0, le=2_000_000_000)
 
     @model_validator(mode="after")
     def valid_cart(self):
@@ -91,12 +105,12 @@ class CheckoutInput(Input):
         variants = {(line.product_id, line.preset_index, line.grams) for line in self.lines}
         if len(variants) != len(self.lines):
             raise ValueError("Combine duplicate items into one cart line")
+        validate_discount(self.discount_type, self.discount_value)
         return self
 
 
 class BillEditLine(CartLine):
     line_id: UUID | None = None
-    unit_price_minor: int | None = Field(default=None, ge=0, le=1_000_000_000)
 
 
 class BillEditInput(Input):
@@ -104,6 +118,8 @@ class BillEditInput(Input):
     customer_id: UUID | None = None
     lines: list[BillEditLine] = Field(min_length=1, max_length=100)
     cash_received_minor: int = Field(ge=0, le=2_000_000_000)
+    discount_type: Literal["amount", "percentage"] | None = None
+    discount_value: int = Field(default=0, ge=0, le=2_000_000_000)
 
     @model_validator(mode="after")
     def valid_bill(self):
@@ -112,7 +128,29 @@ class BillEditInput(Input):
         ids = [line.line_id for line in self.lines if line.line_id is not None]
         if len(ids) != len(set(ids)):
             raise ValueError("Each existing bill line can appear only once")
+        validate_discount(self.discount_type, self.discount_value)
         return self
+
+
+def validate_discount(discount_type, discount_value):
+    if discount_type is None and discount_value:
+        raise ValueError("Choose a discount type")
+    if discount_type is not None and discount_value == 0:
+        raise ValueError("Discount must be greater than zero")
+    if discount_type == "percentage" and discount_value > 10_000:
+        raise ValueError("Percentage discount cannot exceed 100%")
+
+
+def discounted(subtotal: int, discount_type: str | None, discount_value: int):
+    if discount_type == "amount":
+        amount = discount_value
+    elif discount_type == "percentage":
+        amount = (subtotal * discount_value + 5_000) // 10_000
+    else:
+        amount = 0
+    if amount > subtotal:
+        raise HTTPException(422, "Discount cannot exceed the amount being discounted")
+    return amount, subtotal - amount
 
 
 def priced_line(product: Product, line: CartLine):
@@ -136,7 +174,22 @@ def priced_line(product: Product, line: CartLine):
         label = "kg" if product.stock_unit == "gram" else "each"
     divisor = 1000 if product.stock_unit == "gram" else 1
     cost = (product.cost_minor * stock_quantity + divisor // 2) // divisor
-    return stock_quantity, unit_price, unit_price * line.quantity, cost, label
+    catalog_unit_price = unit_price
+    unit_price = line.unit_price_minor if line.unit_price_minor is not None else catalog_unit_price
+    line_subtotal = unit_price * line.quantity
+    discount_minor, line_total = discounted(
+        line_subtotal, line.discount_type, line.discount_value
+    )
+    return (
+        stock_quantity,
+        catalog_unit_price,
+        unit_price,
+        line_subtotal,
+        discount_minor,
+        line_total,
+        cost,
+        label,
+    )
 
 
 async def authorize(db, request, organization_id, permission, *, store_id=None, write=False):
@@ -181,6 +234,10 @@ async def receipt(db, sale):
         "customer": customer.name if customer else None,
         "payment_method": sale.payment_method,
         "status": sale.status,
+        "subtotal_minor": sale.subtotal_minor,
+        "discount_type": sale.discount_type,
+        "discount_value": sale.discount_value,
+        "discount_minor": sale.discount_minor,
         "total_minor": sale.total_minor,
         "cash_received_minor": sale.cash_received_minor,
         "change_minor": sale.cash_received_minor - sale.total_minor,
@@ -193,7 +250,12 @@ async def receipt(db, sale):
                 "quantity": line.quantity,
                 "stock_quantity": line.stock_quantity,
                 "unit_label": line.unit_label,
+                "catalog_unit_price_minor": line.catalog_unit_price_minor,
                 "unit_price_minor": line.unit_price_minor,
+                "line_subtotal_minor": line.line_subtotal_minor,
+                "discount_type": line.discount_type,
+                "discount_value": line.discount_value,
+                "discount_minor": line.discount_minor,
                 "line_total_minor": line.line_total_minor,
             }
             for line in lines
@@ -289,6 +351,21 @@ async def create_product(organization_id: UUID, body: ProductInput, request: Req
         product = Product(organization_id=organization_id, **body.model_dump())
         db.add(product)
         await db.flush()
+        db.add(
+            ProductPriceHistory(
+                organization_id=organization_id,
+                product_id=product.id,
+                actor_id=request.state.identity[0],
+                old_price_minor=None,
+                new_price_minor=product.price_minor,
+                old_cost_minor=None,
+                new_cost_minor=product.cost_minor,
+                old_presets=None,
+                new_presets=product.presets,
+                reason="product_created",
+                created=now(),
+            )
+        )
         service.audit(
             db,
             "product.created",
@@ -296,6 +373,15 @@ async def create_product(organization_id: UUID, body: ProductInput, request: Req
             organization_id=organization_id,
             target_type="products",
             target_id=product.id,
+            changes={
+                "after": {
+                    "name": product.name,
+                    "sku": product.sku,
+                    "price_minor": product.price_minor,
+                    "cost_minor": product.cost_minor,
+                    "presets": product.presets,
+                }
+            },
         )
         return record(product)
 
@@ -364,6 +450,33 @@ async def update_product(
         )
         if duplicate:
             raise HTTPException(409, "SKU or barcode already exists")
+        before = {
+            "name": product.name,
+            "sku": product.sku,
+            "price_minor": product.price_minor,
+            "cost_minor": product.cost_minor,
+            "presets": product.presets,
+        }
+        pricing_changed = (
+            product.price_minor != body.price_minor
+            or product.cost_minor != body.cost_minor
+            or product.presets != [preset.model_dump() for preset in body.presets]
+        )
+        if pricing_changed:
+            db.add(
+                ProductPriceHistory(
+                    organization_id=organization_id,
+                    product_id=product.id,
+                    actor_id=request.state.identity[0],
+                    old_price_minor=product.price_minor,
+                    new_price_minor=body.price_minor,
+                    old_cost_minor=product.cost_minor,
+                    new_cost_minor=body.cost_minor,
+                    old_presets=product.presets,
+                    new_presets=[preset.model_dump() for preset in body.presets],
+                    created=now(),
+                )
+            )
         for field, value in body.model_dump(exclude={"stock_unit"}).items():
             setattr(product, field, value)
         await db.flush()
@@ -374,8 +487,53 @@ async def update_product(
             organization_id=organization_id,
             target_type="products",
             target_id=product.id,
+            changes={
+                "before": before,
+                "after": {
+                    "name": product.name,
+                    "sku": product.sku,
+                    "price_minor": product.price_minor,
+                    "cost_minor": product.cost_minor,
+                    "presets": product.presets,
+                },
+            },
         )
         return record(product)
+
+
+@router.get("/products/{product_id}/price-history")
+async def product_price_history(organization_id: UUID, product_id: UUID, request: Request):
+    async with request.app.state.db() as db, db.begin():
+        _, member = await authorize(db, request, organization_id, "catalog.manage")
+        if not member.all_stores:
+            raise HTTPException(403, "Organization-wide catalog access required")
+        product = await db.scalar(
+            select(Product).where(
+                Product.id == product_id, Product.organization_id == organization_id
+            )
+        )
+        if not product:
+            raise HTTPException(404, "Product not found")
+        rows = (
+            await db.execute(
+                select(ProductPriceHistory, User.full_name, User.email)
+                .outerjoin(User, User.id == ProductPriceHistory.actor_id)
+                .where(
+                    ProductPriceHistory.organization_id == organization_id,
+                    ProductPriceHistory.product_id == product_id,
+                )
+                .order_by(ProductPriceHistory.created.desc())
+                .limit(100)
+            )
+        ).all()
+        return [
+            {
+                **record(history),
+                "actor": full_name or email or "System migration",
+                "product_name": product.name,
+            }
+            for history, full_name, email in rows
+        ]
 
 
 @router.post("/stores/{store_id}/stock", status_code=201)
@@ -589,20 +747,43 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
                 .with_for_update()
             )
         }
-        total = 0
+        subtotal = 0
         prepared = []
         deductions = {}
         for line in body.lines:
             product = products[line.product_id]
-            stock_quantity, unit_price, line_total, cost, label = priced_line(product, line)
+            (
+                stock_quantity,
+                catalog_unit_price,
+                unit_price,
+                line_subtotal,
+                line_discount,
+                line_total,
+                cost,
+                label,
+            ) = priced_line(product, line)
             deductions[line.product_id] = deductions.get(line.product_id, 0) + stock_quantity
-            prepared.append((line, product, stock_quantity, unit_price, line_total, cost, label))
-            total += line_total
+            prepared.append(
+                (
+                    line,
+                    product,
+                    stock_quantity,
+                    catalog_unit_price,
+                    unit_price,
+                    line_subtotal,
+                    line_discount,
+                    line_total,
+                    cost,
+                    label,
+                )
+            )
+            subtotal += line_total
         for product_id, quantity in deductions.items():
             balance = balances.get(product_id)
             if not balance or balance.quantity < quantity:
                 raise HTTPException(409, f"Insufficient stock for {products[product_id].name}")
-        if total > 2_000_000_000:
+        bill_discount, total = discounted(subtotal, body.discount_type, body.discount_value)
+        if subtotal > 2_000_000_000:
             raise HTTPException(422, "Cart total is too large")
         if body.cash_received_minor < total:
             raise HTTPException(
@@ -619,6 +800,10 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
             request_hash=fingerprint,
             receipt_number=f"{store.code}-{store.receipt_sequence:06d}",
             currency=organization.currency,
+            subtotal_minor=subtotal,
+            discount_type=body.discount_type,
+            discount_value=body.discount_value,
+            discount_minor=bill_discount,
             total_minor=total,
             cash_received_minor=body.cash_received_minor,
             payment_method="cash",
@@ -630,7 +815,18 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
         await db.flush()
         for product_id, quantity in deductions.items():
             balances[product_id].quantity -= quantity
-        for line, product, stock_quantity, unit_price, line_total, cost, label in prepared:
+        for (
+            line,
+            product,
+            stock_quantity,
+            catalog_unit_price,
+            unit_price,
+            line_subtotal,
+            line_discount,
+            line_total,
+            cost,
+            label,
+        ) in prepared:
             db.add(
                 SaleLine(
                     sale_id=sale.id,
@@ -640,8 +836,13 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
                     quantity=line.quantity,
                     stock_quantity=stock_quantity,
                     unit_label=label,
+                    catalog_unit_price_minor=catalog_unit_price,
                     unit_price_minor=unit_price,
                     unit_cost_minor=product.cost_minor,
+                    line_subtotal_minor=line_subtotal,
+                    discount_type=line.discount_type,
+                    discount_value=line.discount_value,
+                    discount_minor=line_discount,
                     line_total_minor=line_total,
                     line_cost_minor=cost,
                 )
@@ -667,6 +868,22 @@ async def checkout(organization_id: UUID, store_id: UUID, body: CheckoutInput, r
             organization_id=organization_id,
             target_type="sales",
             target_id=sale.id,
+            changes={
+                "receipt_number": sale.receipt_number,
+                "subtotal_minor": sale.subtotal_minor,
+                "discount_minor": sale.discount_minor,
+                "total_minor": sale.total_minor,
+                "lines": [
+                    {
+                        "product_id": str(line.product_id),
+                        "catalog_unit_price_minor": catalog_price,
+                        "unit_price_minor": unit_price,
+                        "discount_type": line.discount_type,
+                        "discount_value": line.discount_value,
+                    }
+                    for line, _, _, catalog_price, unit_price, _, _, _, _, _ in prepared
+                ],
+            },
         )
         return await receipt(db, sale)
 
@@ -737,6 +954,10 @@ async def edit_sale(
         before = {
             "customer_type": sale.customer_type,
             "customer_id": str(sale.customer_id) if sale.customer_id else None,
+            "subtotal_minor": sale.subtotal_minor,
+            "discount_type": sale.discount_type,
+            "discount_value": sale.discount_value,
+            "discount_minor": sale.discount_minor,
             "total_minor": sale.total_minor,
             "cash_received_minor": sale.cash_received_minor,
             "lines": [
@@ -745,7 +966,11 @@ async def edit_sale(
                     "product_id": str(line.product_id),
                     "quantity": line.quantity,
                     "stock_quantity": line.stock_quantity,
+                    "catalog_unit_price_minor": line.catalog_unit_price_minor,
                     "unit_price_minor": line.unit_price_minor,
+                    "discount_type": line.discount_type,
+                    "discount_value": line.discount_value,
+                    "discount_minor": line.discount_minor,
                 }
                 for line in previous
             ],
@@ -770,7 +995,7 @@ async def edit_sale(
             old_stock[line.product_id] = old_stock.get(line.product_id, 0) + line.stock_quantity
         new_stock = {}
         prepared = []
-        total = 0
+        subtotal = 0
         for entry in body.lines:
             if entry.line_id is not None:
                 line = previous_by_id.get(entry.line_id)
@@ -783,17 +1008,28 @@ async def edit_sale(
                 line.stock_quantity = stock_per_unit * entry.quantity
                 if entry.unit_price_minor is not None:
                     line.unit_price_minor = entry.unit_price_minor
-                line.line_total_minor = line.unit_price_minor * entry.quantity
+                line.line_subtotal_minor = line.unit_price_minor * entry.quantity
+                line.discount_type = entry.discount_type
+                line.discount_value = entry.discount_value
+                line.discount_minor, line.line_total_minor = discounted(
+                    line.line_subtotal_minor, entry.discount_type, entry.discount_value
+                )
                 line.line_cost_minor = (
                     original_cost * entry.quantity + original_quantity // 2
                 ) // original_quantity
                 prepared.append(line)
             else:
                 product = products[entry.product_id]
-                stock_quantity, unit_price, line_total, cost, label = priced_line(product, entry)
-                if entry.unit_price_minor is not None:
-                    unit_price = entry.unit_price_minor
-                    line_total = unit_price * entry.quantity
+                (
+                    stock_quantity,
+                    catalog_unit_price,
+                    unit_price,
+                    line_subtotal,
+                    line_discount,
+                    line_total,
+                    cost,
+                    label,
+                ) = priced_line(product, entry)
                 line = SaleLine(
                     sale_id=sale.id,
                     product_id=product.id,
@@ -802,15 +1038,23 @@ async def edit_sale(
                     quantity=entry.quantity,
                     stock_quantity=stock_quantity,
                     unit_label=label,
+                    catalog_unit_price_minor=catalog_unit_price,
                     unit_price_minor=unit_price,
                     unit_cost_minor=product.cost_minor,
+                    line_subtotal_minor=line_subtotal,
+                    discount_type=entry.discount_type,
+                    discount_value=entry.discount_value,
+                    discount_minor=line_discount,
                     line_total_minor=line_total,
                     line_cost_minor=cost,
                 )
                 prepared.append(line)
             new_stock[line.product_id] = new_stock.get(line.product_id, 0) + line.stock_quantity
-            total += line.line_total_minor
-        if total > 2_000_000_000:
+            subtotal += line.line_total_minor
+        bill_discount, total = discounted(
+            subtotal, body.discount_type, body.discount_value
+        )
+        if subtotal > 2_000_000_000:
             raise HTTPException(422, "Bill total is too large")
         if body.cash_received_minor < total:
             raise HTTPException(422, "Cash received must cover the full bill")
@@ -856,6 +1100,10 @@ async def edit_sale(
         sale.customer_type = body.customer_type
         sale.customer_id = body.customer_id
         sale.cash_received_minor = body.cash_received_minor
+        sale.subtotal_minor = subtotal
+        sale.discount_type = body.discount_type
+        sale.discount_value = body.discount_value
+        sale.discount_minor = bill_discount
         sale.total_minor = total
         await db.flush()
         service.audit(
@@ -870,6 +1118,10 @@ async def edit_sale(
                 "after": {
                     "customer_type": sale.customer_type,
                     "customer_id": str(sale.customer_id) if sale.customer_id else None,
+                    "subtotal_minor": subtotal,
+                    "discount_type": sale.discount_type,
+                    "discount_value": sale.discount_value,
+                    "discount_minor": bill_discount,
                     "total_minor": total,
                     "cash_received_minor": body.cash_received_minor,
                     "lines": [
@@ -878,7 +1130,11 @@ async def edit_sale(
                             "product_id": str(line.product_id),
                             "quantity": line.quantity,
                             "stock_quantity": line.stock_quantity,
+                            "catalog_unit_price_minor": line.catalog_unit_price_minor,
                             "unit_price_minor": line.unit_price_minor,
+                            "discount_type": line.discount_type,
+                            "discount_value": line.discount_value,
+                            "discount_minor": line.discount_minor,
                         }
                         for line in prepared
                     ],

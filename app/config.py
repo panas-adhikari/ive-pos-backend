@@ -4,12 +4,13 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from app.database import check_database_environment, database_url
+from app.database import check_database_environment, database_url, database_url_from_environment
 
 
 class Settings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     database_url: SecretStr = Field(min_length=1)
+    db_provider: Literal["postgres", "supabase"] = "postgres"
     auth_secret: SecretStr = Field(min_length=32)
     environment: Literal["development", "production"] = "production"
     public_origin: str = "https://localhost"
@@ -88,7 +89,9 @@ class Settings(BaseModel):
                 and origin.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
             ):
                 raise ValueError("HTTPS is required except for explicit localhost development")
-        check_database_environment(self.database_url.get_secret_value(), self.environment)
+        check_database_environment(
+            self.database_url.get_secret_value(), self.environment, self.db_provider
+        )
         if self.identity_encryption_key:
             from cryptography.fernet import Fernet
 
@@ -123,7 +126,8 @@ class Settings(BaseModel):
     @classmethod
     def from_environment(cls) -> "Settings":
         return cls(
-            database_url=os.environ["DATABASE_URL"],
+            database_url=database_url_from_environment(),
+            db_provider=os.environ.get("DB_PROVIDER", "postgres"),
             auth_secret=os.environ["AUTH_SECRET"],
             environment=os.environ.get("APP_ENV", "production"),
             public_origin=os.environ["PUBLIC_ORIGIN"],

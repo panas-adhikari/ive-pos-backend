@@ -5,7 +5,15 @@ from sqlalchemy import delete, select
 
 from app.auth.models import AuditEvent, Invitation, Membership, Organization
 from app.auth.security import now
-from app.operations.models import Customer, Product, Sale, SaleLine, StockBalance, StockMovement
+from app.operations.models import (
+    Customer,
+    Product,
+    ProductPriceHistory,
+    Sale,
+    SaleLine,
+    StockBalance,
+    StockMovement,
+)
 from app.stores.models import Register, Store
 
 logger = logging.getLogger(__name__)
@@ -25,6 +33,9 @@ async def purge_organization(db, organization_id) -> bool:
     await db.execute(delete(Sale).where(Sale.organization_id == organization_id))
     await db.execute(delete(StockBalance).where(StockBalance.organization_id == organization_id))
     await db.execute(delete(Customer).where(Customer.organization_id == organization_id))
+    await db.execute(
+        delete(ProductPriceHistory).where(ProductPriceHistory.organization_id == organization_id)
+    )
     await db.execute(delete(Product).where(Product.organization_id == organization_id))
     await db.execute(delete(Register).where(Register.store_id.in_(store_ids)))
     await db.execute(delete(Invitation).where(Invitation.organization_id == organization_id))

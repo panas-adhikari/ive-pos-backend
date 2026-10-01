@@ -8,7 +8,9 @@ x-app: &app
     APP_ENV: production
     RUN_DELETION_WORKER: "false"
     PORT: "8000"
-    DATABASE_URL: ${DATABASE_URL:?Set the application PostgreSQL URL}
+    DB_PROVIDER: ${DB_PROVIDER:-postgres}
+    SUPABASE_DATABASE_URL: ${SUPABASE_DATABASE_URL:-}
+    DATABASE_URL: ${DATABASE_URL:-}
     AUTH_SECRET: ${AUTH_SECRET:?Generate a production authentication secret}
     IDENTITY_ENCRYPTION_KEY: ${IDENTITY_ENCRYPTION_KEY:?Generate and independently save the encryption key}
     PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the HTTPS frontend origin}
@@ -45,6 +47,7 @@ x-app: &app
 
 services:
   db:
+    profiles: [postgres]
     image: ${POSTGRES_IMAGE:-postgres:17-alpine}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?Set a unique production database name}
@@ -73,12 +76,14 @@ services:
     depends_on:
       db:
         condition: service_healthy
+        required: false
 
   api:
     <<: *app
     depends_on:
       db:
         condition: service_healthy
+        required: false
     networks:
       database:
       outbound:
@@ -98,6 +103,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+        required: false
     # Email is optional. Exit 0 when it is unconfigured without a restart loop.
     restart: on-failure
 
@@ -107,6 +113,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+        required: false
 
   proxy:
     image: ${CADDY_IMAGE:-caddy:2-alpine}
@@ -132,6 +139,7 @@ services:
       context: .
       dockerfile: Dockerfile.backup
     environment:
+      DB_PROVIDER: ${DB_PROVIDER:-postgres}
       PGHOST: db
       PGDATABASE: ${POSTGRES_DB}
       PGUSER: ${APP_DATABASE_USER}

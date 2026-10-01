@@ -6,12 +6,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.auth.models import Base
-from app.database import check_database_environment, database_url
+from app.database import database_url_from_environment
 from app.operations import models as operations_models  # noqa: F401
 from app.stores import models  # noqa: F401
 
-url = database_url(os.environ["DATABASE_URL"])
-check_database_environment(url, os.environ.get("APP_ENV", "production"))
+url = database_url_from_environment()
 # Downgrades in the existing history drop tables/columns. Production rollback uses
 # a reviewed forward migration or a restored backup, never an implicit downgrade.
 if os.environ.get("APP_ENV", "production") == "production":

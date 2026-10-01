@@ -69,11 +69,66 @@ python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().
 Use separate strong admin and app DB passwords; the app role is not a superuser.
 Set DATABASE_URL to that application role (percent-encode special password characters).
 Name the production DB `ive_production` or another name ending `_production`.
-The application connects exclusively through DATABASE_URL and accepts `postgresql://`,
+In native mode the application connects through DATABASE_URL and accepts `postgresql://`,
 `postgres://`, or `postgresql+asyncpg://`. It does not discover a host or load a .env file
 in production. The production init script creates the app role only on a new volume.
 Changing env passwords later does not rotate existing PostgreSQL roles; use ALTER ROLE
 through a controlled admin session, update secrets, and restart clients.
+
+## Supabase provider
+
+Set `DB_PROVIDER=supabase`, `SUPABASE_DATABASE_URL` to the direct or session pooler URI
+from Supabase Connect (port 5432, with `?sslmode=require`), and
+`COMPOSE_PROFILES=${DB_PROVIDER:-postgres}` in the production env file. Leave
+`DATABASE_URL` configured for native PostgreSQL so switching back is an env change.
+All API, mail, maintenance, bootstrap, and migration processes use the same selector.
+This requires Docker Compose 2.20+; the `db` service belongs to the `postgres` profile
+and its health dependency is optional when that profile is disabled. Keep the existing
+POSTGRES_* / APP_DATABASE_* placeholders in the env file for Compose interpolation.
+The native database volume is preserved, but no new native database container is started
+in Supabase mode. Stop an already running native `db` container explicitly after cutover
+if you no longer need it; changing profiles does not stop existing containers.
+For Supabase deployment, skip the native `db` startup and `backup` build commands in the
+VM instructions below. Run `prod build api`, `prod run --rm migrate`, then
+`prod up -d api mail-worker maintenance-worker proxy`. Targeting `migrate` explicitly
+enables its tools profile; no `--profile tools` flag is needed. If using explicit
+`--profile` flags, include the selected provider too: CLI profiles override
+`COMPOSE_PROFILES`.
+
+For a fresh Supabase database, disable its Data API if only this backend accesses it,
+and use a dedicated database role with permissions to create/migrate the app's tables.
+Application tenant authorization and authentication continue to run in this backend.
+Do not expose these app tables through the Supabase Data API without suitable permissions
+and RLS policies. Choose pool sizes within the destination's connection budget, accounting
+for every API process and worker (`DB_POOL_SIZE` / `DB_MAX_OVERFLOW`).
+
+For an existing database, stop writers before the final dump, restore only the application
+schema/data (including `alembic_version`) using `--no-owner --no-privileges`, and preserve
+Supabase's managed schemas. Restore into a fresh destination; do not apply migrations first
+and then attempt to restore the same tables. Grant privileges to the app role after restore.
+Run the existing Compose `migrate` task with the new env file, compare row counts, sequences,
+financial/stock aggregates and schema revision, then start the API and workers. Keep the
+existing authentication/encryption secrets. The native `backup` task refuses Supabase mode;
+configure and verify Supabase backups/recovery separately. Provider switching does not
+automatically replicate or transfer data, and switching back after new writes needs a fresh
+data transfer. Never delete the old volume as part of cutover.
+
+## Platform-only transfer
+
+For a platform-only transfer into a fresh Supabase project, export the backend env and
+preview with `python -m app.platform.migrate` from `backend/`. Then run the same command
+with `--apply`. The tool reads native Docker PostgreSQL by default (or
+`SOURCE_DATABASE_URL` if configured), applies the current schema, and copies only
+`super_admin`/`employee` platform users and their audit events without organization
+references. UUIDs, password hashes, MFA secrets, and recovery hashes are preserved;
+audit session references are cleared and old login sessions are not copied. All
+organization and business tables stay empty. It refuses a populated destination or
+schema mismatch and verifies the copied records before committing. Keep the original
+`IDENTITY_ENCRYPTION_KEY`, pause writers during the transfer, and switch `DB_PROVIDER`
+only after verification. Direct IPv6 endpoints need an IPv6 route; use Supabase's
+session pooler URI on port 5432 for an IPv4-only host.
+
+## Application origin and secrets
 
 PUBLIC_ORIGIN=https://app.your-domain is the sole CORS/CSRF origin and email-link base;
 there is no redundant CORS_ORIGINS setting. Production uses Secure, HttpOnly,
