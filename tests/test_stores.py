@@ -41,6 +41,8 @@ async def owner(setup):
     async with app.state.db() as db, db.begin():
         user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
         user.email_verified = True
+        # These tests cover the optional repeated-verification policy.
+        user.require_action_verification = True
         user.mfa_secret = cipher(app.state.settings).encrypt(b"JBSWY3DPEHPK3PXP").decode()
         user.recovery_hashes = [digest(code) for code in CODES]
         membership = await db.scalar(select(Membership).where(Membership.user_id == user.id))

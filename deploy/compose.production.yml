@@ -14,6 +14,7 @@ x-app: &app
     AUTH_SECRET: ${AUTH_SECRET:?Generate a production authentication secret}
     IDENTITY_ENCRYPTION_KEY: ${IDENTITY_ENCRYPTION_KEY:?Generate and independently save the encryption key}
     PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the HTTPS frontend origin}
+    TENANT_BASE_DOMAIN: ${TENANT_BASE_DOMAIN:-}
     FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.30.90.2}
     DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
     DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}

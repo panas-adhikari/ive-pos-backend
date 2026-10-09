@@ -50,7 +50,7 @@ class ResetInput(LinkInput):
 
 
 class Reauthenticate(Input):
-    password: SecretStr = Field(min_length=1, max_length=128)
+    password: SecretStr = Field(default=SecretStr(""), max_length=128)
     code: SecretStr = Field(default=SecretStr(""), max_length=64)
 
 
@@ -104,12 +104,15 @@ async def email_complete(body: LinkInput, request: Request):
 
 async def reauthenticate(request, db, body):
     user, session = await service.locked_identity(request, db)
+    if service.action_verified(user, session):
+        return user, session
     if not await password_work(
         request, verify_password, user.password_hash, body.password.get_secret_value()
     ):
         raise HTTPException(400, "Invalid password or authentication code")
     if not accept_factor(request.app.state.settings, user, body.code.get_secret_value()):
         raise HTTPException(400, "Invalid password or authentication code")
+    session.mfa_verified = bool(user.mfa_secret)
     return user, session
 
 
@@ -121,7 +124,14 @@ async def verify_request(body: Reauthenticate, request: Request):
         user, _ = await reauthenticate(request, db, body)
         if not user.email_verified:
             await service.throttle(request, "email", user.email)
-            onboarding.enqueue_link(db, request.app.state.settings, user.email, "verify", user)
+            onboarding.enqueue_link(
+                db,
+                request.app.state.settings,
+                user.email,
+                "verify",
+                user,
+                origin=getattr(request.state, "site_origin", None),
+            )
             service.audit(db, "email.verification_requested", user.id)
     return {"message": onboarding.GENERIC_MESSAGE}
 
@@ -180,9 +190,21 @@ async def confirm(body: CodeInput, request: Request, response: Response):
         user.mfa_pending_expires = None
         codes, user.recovery_hashes = backup_codes()
         await db.execute(update(Session).where(Session.user_id == user.id).values(revoked=True))
+        # The confirmed factor proves this browser's identity. Replace its pre-MFA
+        # credentials while revoking every previously issued session.
+        verified_session = Session(
+            user_id=user.id,
+            tenant_id=session.tenant_id,
+            created=now(),
+            expires=session.expires,
+            mfa_verified=True,
+            step_up_expires=min(now() + timedelta(minutes=5), session.expires),
+        )
+        db.add(verified_session)
+        tokens = await service.issue_tokens(db, verified_session)
         service.audit(db, "mfa.enabled", user.id, session.id)
         notify_security_change(db, request, user, "MFA was enabled")
-    cookies(response, request)
+    cookies(response, request, tokens)
     return {"recovery_codes": codes}
 
 
@@ -224,6 +246,31 @@ async def step_up(body: Reauthenticate, request: Request):
             raise HTTPException(
                 403, "Verify your email and enable MFA before changing business settings"
             )
+        session.mfa_verified = True
         session.step_up_expires = min(now() + timedelta(minutes=5), session.expires)
         service.audit(db, "session.step_up", user.id, session.id)
-        return {"expires": session.step_up_expires}
+        return {"expires": service.verification_expires(user, session)}
+
+
+class SecurityPreferences(Reauthenticate):
+    require_action_verification: bool
+
+
+@router.post("/security-preferences")
+async def security_preferences(body: SecurityPreferences, request: Request):
+    await service.throttle(request, "security", str(request.state.identity[0]))
+    async with request.app.state.db() as db, db.begin():
+        # Authorize using the old preference before allowing it to be relaxed.
+        user, session = await reauthenticate(request, db, body)
+        user.require_action_verification = body.require_action_verification
+        await db.execute(
+            update(Session).where(Session.user_id == user.id).values(step_up_expires=None)
+        )
+        service.audit(
+            db,
+            "account.security_preferences_updated",
+            user.id,
+            session.id,
+            changes={"require_action_verification": body.require_action_verification},
+        )
+        return {"require_action_verification": user.require_action_verification}

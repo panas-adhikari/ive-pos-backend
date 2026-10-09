@@ -28,7 +28,9 @@ class SecurityMiddleware:
 
         if scope["method"] not in {"GET", "HEAD", "OPTIONS"}:
             if (
-                headers.get(b"origin", b"").decode() != settings.public_origin
+                headers.get(b"origin", b"").decode() not in scope.get("state", {}).get(
+                    "allowed_origins", [settings.public_origin]
+                )
                 or headers.get(b"x-pos-csrf") != b"1"
                 or headers.get(b"sec-fetch-site") == b"cross-site"
             ):

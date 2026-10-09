@@ -144,8 +144,7 @@ async def authorize(db, request, organization_id, *, write=False):
     if write and (
         not user.email_verified
         or not user.mfa_secret
-        or not session.step_up_expires
-        or session.step_up_expires <= now()
+        or not service.action_verified(user, session)
     ):
         raise HTTPException(403, "Unlock changes with your password and MFA code first")
     return member

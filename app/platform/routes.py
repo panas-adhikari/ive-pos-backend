@@ -5,21 +5,30 @@ from datetime import timedelta
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request as URLRequest, urlopen
+from urllib.request import Request as URLRequest
+from urllib.request import urlopen
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select, text
 
-from app.auth import service
-from app.auth import onboarding
+from app.auth import onboarding, service
 from app.auth.mail import queue_mail
 from app.auth.models import AuditEvent, Membership, Organization, Session, User
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, verify_password
 from app.platform.deletion import purge_organization
 from app.stores.routes import CURRENCIES, TIMEZONES
+from app.tenancy.service import allocate_slug, organization_origin, validate_slug
 
 router = APIRouter(prefix="/api/v1/platform", tags=["Platform control"])
 _geocoder_lock = asyncio.Lock()
@@ -44,6 +53,13 @@ class OrganizationLimits(BaseModel):
 
 class OrganizationInvite(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    slug: str | None = Field(default=None, max_length=63)
+
+    @field_validator("slug")
+    @classmethod
+    def valid_slug(cls, value):
+        return validate_slug(value) if value else None
+
     name: str = Field(min_length=1, max_length=160)
     owner_email: EmailStr = Field(max_length=254)
     owner_email_confirmed: bool = True
@@ -93,7 +109,12 @@ class OrganizationInvite(BaseModel):
         value = value.strip()
         if value:
             parsed = urlsplit(value)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
                 raise ValueError("Use a valid http or https URL")
         return value
 
@@ -136,8 +157,8 @@ def require_super_admin(actor):
         raise HTTPException(403, "Platform super administrator access required")
 
 
-def require_step_up(session: Session):
-    if not session.step_up_expires or session.step_up_expires <= now():
+def require_step_up(actor: User, session: Session):
+    if not service.action_verified(actor, session):
         raise HTTPException(403, "Verify your password and MFA before changing platform data")
 
 
@@ -176,9 +197,12 @@ async def geocode_city(request: Request, q: str = Query(min_length=2, max_length
         )
         try:
             async with request.app.state.db() as db, db.begin():
-                await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 904506683372797880})
+                await db.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"), {"key": 904506683372797880}
+                )
                 started = time.monotonic()
                 try:
+
                     def fetch_places():
                         with urlopen(external, timeout=8) as response:
                             return json.loads(response.read(64_000))
@@ -191,16 +215,20 @@ async def geocode_city(request: Request, q: str = Query(min_length=2, max_length
         results = []
         for place in payload if isinstance(payload, list) else []:
             try:
-                results.append({
-                    "name": str(place.get("display_name", ""))[:240],
-                    "latitude": float(place["lat"]),
-                    "longitude": float(place["lon"]),
-                })
+                results.append(
+                    {
+                        "name": str(place.get("display_name", ""))[:240],
+                        "latitude": float(place["lat"]),
+                        "longitude": float(place["lon"]),
+                    }
+                )
             except (AttributeError, KeyError, TypeError, ValueError):
                 continue
         _geocoder_cache[cache_key] = (time.monotonic() + 86_400, results)
         if len(_geocoder_cache) > 256:
-            expired = [key for key, (expires, _) in _geocoder_cache.items() if expires <= time.monotonic()]
+            expired = [
+                key for key, (expires, _) in _geocoder_cache.items() if expires <= time.monotonic()
+            ]
             for key in expired:
                 _geocoder_cache.pop(key, None)
             while len(_geocoder_cache) > 256:
@@ -213,16 +241,19 @@ async def invite_organization(body: OrganizationInvite, request: Request):
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         owner_email = str(body.owner_email)
         await db.execute(
             text("SELECT pg_advisory_xact_lock(:key)"),
             {"key": int(digest(owner_email)[:15], 16)},
         )
         if await db.scalar(select(User.id).where(User.email == owner_email).with_for_update()):
-            raise HTTPException(409, "An account already uses this email. Choose another owner email.")
+            raise HTTPException(
+                409, "An account already uses this email. Choose another owner email."
+            )
         organization = Organization(
             name=body.name,
+            slug=await allocate_slug(db, body.name, body.slug),
             contact_email=owner_email,
             phone=body.owner_phone or body.phone or "",
             organization_type=body.organization_type,
@@ -268,11 +299,22 @@ async def invite_organization(body: OrganizationInvite, request: Request):
             organization_id=organization.id,
             target_type="organizations",
             target_id=organization.id,
-            changes={"owner_email": owner_email, "organization_type": body.organization_type,
-                "store_limit": body.store_limit, "employee_limit": body.employee_limit,
-                "owner_access": "temporary_password"},
+            changes={
+                "owner_email": owner_email,
+                "organization_type": body.organization_type,
+                "store_limit": body.store_limit,
+                "employee_limit": body.employee_limit,
+                "owner_access": "temporary_password",
+            },
         )
-        return {"id": organization.id, "name": organization.name, "configured": False}
+        return {
+            "id": organization.id,
+            "name": organization.name,
+            "configured": False,
+            "slug": organization.slug,
+            "login_url": organization_origin(request.app.state.settings, organization.slug)
+            + "/login",
+        }
 
 
 @router.post("/organizations/{organization_id}/owner-credentials-email", status_code=202)
@@ -284,7 +326,7 @@ async def email_owner_credentials(
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         organization = await db.scalar(
             select(Organization).where(Organization.id == organization_id).with_for_update()
         )
@@ -301,6 +343,7 @@ async def email_owner_credentials(
             or not await password_work(request, verify_password, owner.password_hash, password)
         ):
             raise HTTPException(400, "Temporary sign-in details are no longer valid")
+        login_url = organization_origin(request.app.state.settings, organization.slug) + "/login"
         queue_mail(
             db,
             request.app.state.settings,
@@ -309,10 +352,12 @@ async def email_owner_credentials(
             f"Hello {owner.full_name},\n\n"
             f"Your administrator account for {organization.name} is ready.\n\n"
             f"Email: {owner.email}\nTemporary password: {password}\n\n"
-            f"Sign in at {request.app.state.settings.public_origin}. You must choose a new password "
-            "before continuing. Keep these sign-in details private and delete this email after use.",
+            f"Sign in at {login_url}. "
+            "You must choose a new password "
+            "before continuing. Keep these sign-in details private "
+            "and delete this email after use.",
             expires=now() + timedelta(hours=1),
-            action_url=request.app.state.settings.public_origin,
+            action_url=login_url,
             action_label="Sign in to Ive POS",
         )
         service.audit(
@@ -349,8 +394,15 @@ async def organizations(request: Request):
                 "name": organization.name,
                 "organization_type": organization.organization_type,
                 "image_url": organization.image_url,
+                "slug": organization.slug,
+                "login_url": organization_origin(request.app.state.settings, organization.slug)
+                + "/login",
                 "location_label": organization.location_label,
                 "configured": organization.configured,
+                "billing_plan": organization.billing_plan,
+                "billing_amount_minor": organization.billing_amount_minor,
+                "billing_currency": organization.billing_currency,
+                "billing_interval": organization.billing_interval,
                 "store_limit": organization.store_limit,
                 "employee_limit": organization.employee_limit,
                 "active_employees": active_employees,
@@ -378,17 +430,25 @@ async def organization_detail(organization_id: UUID, request: Request):
             select(func.count()).select_from(Store).where(Store.organization_id == organization.id)
         )
         owner = await db.scalar(select(User).where(User.email == organization.contact_email))
-        limit_requests = list(await db.scalars(
-            select(AuditEvent).where(
-                AuditEvent.organization_id == organization.id,
-                AuditEvent.action == "organization.store_limit_requested",
-            ).order_by(AuditEvent.created.desc()).limit(5)
-        ))
+        limit_requests = list(
+            await db.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.organization_id == organization.id,
+                    AuditEvent.action == "organization.store_limit_requested",
+                )
+                .order_by(AuditEvent.created.desc())
+                .limit(5)
+            )
+        )
         return {
             "id": organization.id,
             "name": organization.name,
             "organization_type": organization.organization_type,
             "image_url": organization.image_url,
+            "slug": organization.slug,
+            "login_url": organization_origin(request.app.state.settings, organization.slug)
+            + "/login",
             "website_url": organization.website_url,
             "location_label": organization.location_label,
             "latitude": organization.latitude,
@@ -405,11 +465,17 @@ async def organization_detail(organization_id: UUID, request: Request):
             "employee_limit": organization.employee_limit,
             "active_employees": active_employees,
             "stores": stores,
-            "billing_tier": None,
+            "billing_tier": organization.billing_plan,
+            "billing_plan": organization.billing_plan,
+            "billing_amount_minor": organization.billing_amount_minor,
+            "billing_currency": organization.billing_currency,
+            "billing_interval": organization.billing_interval,
+            "version": organization.version,
             "deletion_scheduled_for": organization.deletion_scheduled_for,
             "store_limit_requests": [
                 {"id": row.id, "created": row.created, **(row.changes or {})}
-                for row in limit_requests if (row.changes or {}).get("requested_limit", 0) > organization.store_limit
+                for row in limit_requests
+                if (row.changes or {}).get("requested_limit", 0) > organization.store_limit
             ],
         }
 
@@ -419,7 +485,7 @@ async def limits(body: OrganizationLimits, organization_id: UUID, request: Reque
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         organization = await db.scalar(
             select(Organization).where(Organization.id == organization_id).with_for_update()
         )
@@ -449,7 +515,7 @@ async def delete_organization(body: OrganizationDeletion, organization_id: UUID,
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         organization = await db.scalar(
             select(Organization).where(Organization.id == organization_id).with_for_update()
         )
@@ -497,7 +563,7 @@ async def cancel_organization_deletion(organization_id: UUID, request: Request):
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         organization = await db.scalar(
             select(Organization).where(Organization.id == organization_id).with_for_update()
         )
@@ -523,7 +589,7 @@ async def add_employee(body: PlatformEmployee, request: Request):
     async with request.app.state.db() as db, db.begin():
         actor, session = await service.locked_identity(request, db)
         require_super_admin(actor)
-        require_step_up(session)
+        require_step_up(actor, session)
         user = await db.scalar(select(User).where(User.email == str(body.email)).with_for_update())
         if not user or not user.active or not user.email_verified:
             raise HTTPException(409, "Use an existing active account with a verified email address")

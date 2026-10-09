@@ -21,6 +21,7 @@ from app.auth.security import (
     token,
     verify_password,
 )
+from app.tenancy.service import request_tenant_id, session_matches_tenant, tenant_membership
 
 
 def audit(
@@ -87,7 +88,9 @@ def session_valid(session, user):
     )
 
 
-async def has_console_access(db, user_id):
+async def has_console_access(db, user_id, tenant_id=None):
+    if tenant_id is not None:
+        return await tenant_membership(db, user_id, tenant_id)
     user = await db.get(User, user_id)
     if user and user.platform_role in PLATFORM_ROLES - {"none"}:
         return True
@@ -112,7 +115,9 @@ async def access_identity(request: Request):
         ).first()
         if result is None or not session_valid(*result) or result.Session.access_expires <= now():
             raise HTTPException(401, "Authentication required")
-        if not await has_console_access(db, result.User.id):
+        if not session_matches_tenant(request, result.Session) or not await has_console_access(
+            db, result.User.id, request_tenant_id(request)
+        ):
             raise HTTPException(401, "Authentication required")
         if result.User.must_change_password and (request.method, request.url.path) not in {
             ("GET", "/api/v1/auth/me"),
@@ -124,6 +129,8 @@ async def access_identity(request: Request):
 
 # FastAPI's global dependency makes newly added endpoints protected by default.
 PUBLIC_ENDPOINTS = {
+    ("GET", "/api/v1/public/site"),
+    ("GET", "/api/v1/public/domain-check"),
     ("POST", "/api/v1/auth/invitations/inspect"),
     ("POST", "/api/v1/auth/invitations/accept"),
     ("GET", "/api/v1/auth/capabilities"),
@@ -143,6 +150,14 @@ PUBLIC_ENDPOINTS = {
 async def require_auth(request: Request):
     if (request.method, request.url.path) not in PUBLIC_ENDPOINTS:
         request.state.identity = await access_identity(request)
+        tenant_id = request_tenant_id(request)
+        if tenant_id:
+            if request.url.path.startswith("/api/v1/platform/"):
+                raise HTTPException(403, "Use the platform sign-in address")
+            if request.url.path.startswith("/api/v1/organizations/"):
+                target = request.url.path.split("/")[4]
+                if target != str(tenant_id):
+                    raise HTTPException(403, "Organization access denied")
 
 
 async def scoped_permission(db, request, organization_id, permission, store_id=None):
@@ -188,6 +203,20 @@ async def require_platform_role(request: Request, *roles: str):
         return user
 
 
+def verification_expires(user, session):
+    """MFA proof belongs to a live server session; preferences never create proof."""
+    if not user.email_verified or not user.mfa_secret or not session_valid(session, user):
+        return None
+    if session.mfa_verified and not user.require_action_verification:
+        return min(session.expires, session.idle_expires)
+    return session.step_up_expires
+
+
+def action_verified(user, session):
+    expires = verification_expires(user, session)
+    return bool(expires and expires > now())
+
+
 async def issue_tokens(db, session):
     access, refresh = token(), token()
     timestamp = now()
@@ -210,7 +239,7 @@ async def login(request, email, password, code=""):
         if not valid or not user or not user.active:
             audit(db, "login.failed")
             result = None
-        elif not await has_console_access(db, user.id):
+        elif not await has_console_access(db, user.id, request_tenant_id(request)):
             audit(db, "login.failed")
             result = None
         elif not accept_factor(request.app.state.settings, user, code):
@@ -235,7 +264,11 @@ async def login(request, email, password, code=""):
                 older.revoked = True
                 audit(db, "session.limit_revoked", user.id, older.id)
             session = Session(
-                user_id=user.id, created=now(), expires=now() + timedelta(seconds=SESSION_SECONDS)
+                user_id=user.id,
+                created=now(),
+                expires=now() + timedelta(seconds=SESSION_SECONDS),
+                mfa_verified=bool(user.mfa_secret),
+                tenant_id=request_tenant_id(request),
             )
             db.add(session)
             result = await issue_tokens(db, session)
@@ -263,10 +296,14 @@ async def refresh(request):
                 select(Session).where(Session.id == record.session_id).with_for_update()
             )
             await db.refresh(record)  # Observe concurrent rotation after the lock was acquired.
+            if not session_matches_tenant(request, session):
+                raise HTTPException(401, "Authentication required")
             if record.used:
                 session.revoked = True
                 audit(db, "refresh.replay", user_id, session.id)
-            elif session_valid(session, user) and await has_console_access(db, user.id):
+            elif session_valid(session, user) and await has_console_access(
+                db, user.id, request_tenant_id(request)
+            ):
                 record.used = True
                 result = await issue_tokens(db, session)
                 audit(db, "refresh.rotated", user_id, session.id)
@@ -284,7 +321,7 @@ async def logout(request):
         session = await db.get(Session, record.session_id) if record else None
         if session is None and access and len(access) <= 128:
             session = await db.scalar(select(Session).where(Session.access_hash == digest(access)))
-        if session:
+        if session and session_matches_tenant(request, session):
             await db.scalar(select(User).where(User.id == session.user_id).with_for_update())
             await db.execute(update(Session).where(Session.id == session.id).values(revoked=True))
             audit(db, "logout", session.user_id, session.id)
@@ -297,6 +334,7 @@ async def locked_identity(request, db):
     raw = request.cookies.get(request.app.state.settings.cookie_name("access"), "")
     if (
         not session_valid(session, user)
+        or not session_matches_tenant(request, session)
         or session.access_expires <= now()
         or session.access_hash != digest(raw)
     ):
@@ -309,11 +347,13 @@ async def change_password(request, current_password, new_password, code=""):
     accepted = False
     async with request.app.state.db() as db, db.begin():
         user, session = await locked_identity(request, db)
-        if await password_work(
-            request, verify_password, user.password_hash, current_password
-        ) and accept_factor(request.app.state.settings, user, code) and (
-            not user.must_change_password or current_password != new_password
-        ):
+        if (
+            action_verified(user, session)
+            or (
+                await password_work(request, verify_password, user.password_hash, current_password)
+                and accept_factor(request.app.state.settings, user, code)
+            )
+        ) and (not user.must_change_password or current_password != new_password):
             user.password_hash = await password_work(request, PASSWORD_HASHER.hash, new_password)
             user.must_change_password = False
             user.mfa_pending = None

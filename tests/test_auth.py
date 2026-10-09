@@ -57,7 +57,8 @@ async def setup():
         async with app.state.db() as db, db.begin():
             await db.execute(
                 text(
-                    "TRUNCATE stock_movements, sale_lines, sales, stock_balances, products, "
+                    "TRUNCATE platform_payments, product_price_history, stock_movements, "
+                    "sale_lines, sales, stock_balances, products, "
                     "customers, invitations, registers, stores, auth_email_challenges, "
                     "auth_mail_outbox, "
                     "auth_audit_events, auth_refresh_tokens, "
@@ -430,7 +431,7 @@ async def latest_link(app, email, purpose):
             payload = json.loads(cipher(app.state.settings).decrypt(row.payload.encode()))
             if payload["email"] == email and "#identity=" + purpose in payload["body"]:
                 link = payload["body"].split("\n\n")[1]
-                assert link.startswith(ORIGIN + "/#")
+                assert link.startswith(ORIGIN + "/#") or link.startswith(ORIGIN + "/login#")
                 return parse_qs(urlsplit(link).fragment)["token"][0]
     raise AssertionError("No matching email")
 
@@ -597,7 +598,10 @@ async def test_mfa_enrollment_login_replay_and_encrypted_storage(setup):
     app, client = setup
     secret, backups, used_code = await enable_mfa(app, client)
     assert len(backups) == len(set(backups)) == 10
-    assert (await me(client)).status_code == 401
+    current = await me(client)
+    assert current.status_code == 200
+    assert current.json()["mfa_enabled"] is True
+    assert current.json()["step_up_expires"]
     assert (await login(client)).status_code == 401
     async with app.state.db() as db:
         user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
@@ -618,6 +622,90 @@ async def test_mfa_enrollment_login_replay_and_encrypted_storage(setup):
     )
     assert sorted(r.status_code for r in results) == [204, 401]
     assert (await me(client)).json()["mfa_enabled"] is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("require_verification", [False, True])
+@pytest.mark.parametrize("tenant_scoped", [False, True])
+async def test_mfa_confirmation_replaces_browser_session_and_revokes_older_sessions(
+    setup, require_verification, tenant_scoped
+):
+    import pyotp
+
+    from app.auth import service
+
+    app, client = setup
+    origin = ORIGIN
+    tenant_id = None
+    if tenant_scoped:
+        app.state.settings.tenant_base_domain = "example.test"
+        async with app.state.db() as db, db.begin():
+            organization = await db.scalar(
+                select(Organization).where(Organization.name == "Store 0")
+            )
+            organization.slug = "alpha"
+            tenant_id = organization.id
+        origin = "https://alpha.example.test"
+        client.base_url = origin
+        client.headers["Origin"] = origin
+    assert (await login(client)).status_code == 204
+    async with app.state.db() as db, db.begin():
+        user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
+        user.email_verified = True
+    before = (await me(client)).json()
+    old_access = client.cookies.get("__Host-pos_access")
+    old_refresh = client.cookies.get("__Host-pos_refresh")
+    async with app.state.db() as db, db.begin():
+        user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
+        user.require_action_verification = require_verification
+        original = await db.get(Session, UUID(before["session_id"]))
+        original_expiry = original.expires
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=origin,
+        headers={**HEADERS, "Origin": origin},
+    ) as other:
+        assert (await login(other)).status_code == 204
+        secret = (
+            await client.post("/api/v1/auth/mfa/enroll", json={"password": PASSWORD})
+        ).json()["secret"]
+        confirmed = await client.post(
+            "/api/v1/auth/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}
+        )
+        assert confirmed.status_code == 200
+        current = (await me(client)).json()
+        assert current["session_id"] != before["session_id"]
+        assert current["mfa_enabled"] is True
+        assert current["step_up_expires"]
+        assert client.cookies.get("__Host-pos_access") != old_access
+        assert client.cookies.get("__Host-pos_refresh") != old_refresh
+        assert (await me(other)).status_code == 401
+        assert (await other.post("/api/v1/auth/refresh", json={})).status_code == 401
+        assert (
+            await client.get(
+                "/api/v1/auth/me", headers={"Cookie": f"__Host-pos_access={old_access}"}
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                "/api/v1/auth/refresh",
+                json={},
+                headers={"Cookie": f"__Host-pos_refresh={old_refresh}"},
+            )
+        ).status_code == 401
+        # Rejected old credentials cannot revoke the replacement session.
+        assert (await client.post("/api/v1/auth/refresh", json={})).status_code == 204
+        assert (await me(client)).status_code == 200
+    async with app.state.db() as db:
+        user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
+        replacement = await db.get(Session, UUID(current["session_id"]))
+        assert replacement.mfa_verified and not replacement.revoked
+        assert replacement.tenant_id == tenant_id
+        assert replacement.expires == original_expiry
+        assert replacement.step_up_expires <= now() + timedelta(minutes=5)
+        assert service.action_verified(user, replacement)
+        replacement.step_up_expires = now() - timedelta(seconds=1)
+        assert service.action_verified(user, replacement) is (not require_verification)
 
 
 @pytest.mark.anyio
@@ -648,6 +736,9 @@ async def test_mfa_recovery_requires_factor_and_preserves_mfa(setup):
 @pytest.mark.anyio
 async def test_mfa_disable_and_code_replacement_require_reauthentication(setup):
     app, client = setup
+    async with app.state.db() as db, db.begin():
+        user = await db.scalar(select(User).where(User.email == "owner0@example.com"))
+        user.require_action_verification = True
     _, backups, _ = await enable_mfa(app, client)
     await client.post(
         "/api/v1/auth/login",

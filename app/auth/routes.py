@@ -25,7 +25,7 @@ class Credentials(BaseModel):
 
 class PasswordChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    current_password: SecretStr = Field(min_length=1, max_length=128)
+    current_password: SecretStr = Field(default=SecretStr(""), max_length=128)
     new_password: SecretStr = Field(min_length=15, max_length=128)
     code: SecretStr = Field(default=SecretStr(""), max_length=64)
 
@@ -101,16 +101,20 @@ async def me(request: Request):
             "full_name": user.full_name,
             "phone": user.phone,
             "job_title": user.job_title,
-            "platform_role": user.platform_role,
+            "platform_role": "none"
+            if getattr(request.state, "tenant_id", None)
+            else user.platform_role,
             "email_verified": user.email_verified,
             "must_change_password": user.must_change_password,
             "mfa_enabled": bool(user.mfa_secret),
             "session_id": session_id,
-            "step_up_expires": session.step_up_expires,
+            "step_up_expires": service.verification_expires(user, session),
+            "require_action_verification": user.require_action_verification,
             "memberships": [
                 {
                     "organization_id": org.id,
                     "name": org.name,
+                    "slug": org.slug,
                     "image_url": org.image_url,
                     "organization_type": org.organization_type,
                     "permissions": membership.permissions,
@@ -119,6 +123,8 @@ async def me(request: Request):
                     "store_ids": membership.store_ids,
                 }
                 for membership, org in memberships
+                if not getattr(request.state, "tenant_id", None)
+                or org.id == request.state.tenant_id
             ],
         }
 
@@ -132,8 +138,12 @@ async def update_profile(body: ProfileUpdate, request: Request):
         user.phone = body.phone
         user.job_title = body.job_title
         service.audit(
-            db, "account.profile_updated", user.id, session.id,
-            target_type="users", target_id=user.id,
+            db,
+            "account.profile_updated",
+            user.id,
+            session.id,
+            target_type="users",
+            target_id=user.id,
             changes={"before": before, "after": body.model_dump()},
         )
         return {"full_name": user.full_name, "phone": user.phone, "job_title": user.job_title}
