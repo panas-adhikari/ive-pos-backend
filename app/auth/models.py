@@ -1,7 +1,17 @@
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -26,6 +36,7 @@ class User(Base):
     platform_role: Mapped[str] = mapped_column(String(32), default="none")
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    require_action_verification: Mapped[bool] = mapped_column(Boolean, default=False)
     mfa_secret: Mapped[str | None] = mapped_column(String(512), nullable=True)
     mfa_pending: Mapped[str | None] = mapped_column(String(512), nullable=True)
     mfa_pending_expires: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -36,6 +47,7 @@ class User(Base):
 class Organization(Base):
     __tablename__ = "organizations"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+    slug: Mapped[str] = mapped_column(String(63), unique=True, default=lambda: f"org-{uuid7().hex}")
     name: Mapped[str] = mapped_column(String(160))
     contact_email: Mapped[str] = mapped_column(String(254), default="")
     phone: Mapped[str] = mapped_column(String(40), default="")
@@ -49,6 +61,10 @@ class Organization(Base):
     timezone: Mapped[str] = mapped_column(String(80), default="Asia/Kathmandu")
     receipt_footer: Mapped[str] = mapped_column(String(500), default="")
     configured: Mapped[bool] = mapped_column(Boolean, default=False)
+    billing_plan: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    billing_amount_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    billing_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    billing_interval: Mapped[str | None] = mapped_column(String(10), nullable=True)
     # Platform-managed commercial limits until package plans are introduced.
     store_limit: Mapped[int] = mapped_column(Integer, default=1)
     employee_limit: Mapped[int] = mapped_column(Integer, default=5)
@@ -74,6 +90,8 @@ class Session(Base):
     __tablename__ = "auth_sessions"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    # Historical scope survives organization deletion; it must never become a root session.
+    tenant_id: Mapped[UUID | None] = mapped_column(nullable=True)
     access_hash: Mapped[str] = mapped_column(String(64), unique=True)
     access_expires: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     idle_expires: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -81,6 +99,7 @@ class Session(Base):
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_used: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    mfa_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     step_up_expires: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -146,3 +165,25 @@ class Invitation(Base):
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     expires: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="pending")
+
+
+class PlatformPayment(Base):
+    __tablename__ = "platform_payments"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "client_key", name="uq_platform_payment_client"),
+        CheckConstraint("amount_minor > 0", name="ck_platform_payment_amount"),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    actor_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    client_key: Mapped[UUID] = mapped_column()
+    amount_minor: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3))
+    paid_on: Mapped[date] = mapped_column(Date)
+    method: Mapped[str] = mapped_column(String(20))
+    reference: Mapped[str] = mapped_column(String(120), default="")
+    created: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    void_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)

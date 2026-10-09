@@ -9,6 +9,7 @@ from app.auth.mail import queue_mail
 from app.auth.models import EmailChallenge, Membership, Organization, Session, User
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, token
+from app.tenancy.service import allocate_slug, request_tenant_id, tenant_membership
 
 GENERIC_MESSAGE = "If this address is eligible, an email will arrive shortly."
 
@@ -20,19 +21,32 @@ def require_email(request):
 
 async def request_link(request, email, purpose):
     require_email(request)
+    if purpose == "signup" and request_tenant_id(request):
+        raise HTTPException(403, "Ask your organization administrator for an account")
     await service.throttle(request, "email", email)
     async with request.app.state.db() as db, db.begin():
         user = await db.scalar(select(User).where(User.email == email))
         eligible = (purpose == "signup" and user is None) or (
             purpose == "reset" and user and user.active and user.email_verified
         )
+        if eligible and request_tenant_id(request):
+            eligible = bool(
+                user and await tenant_membership(db, user.id, request_tenant_id(request))
+            )
         if eligible:
-            enqueue_link(db, request.app.state.settings, email, purpose, user)
+            enqueue_link(
+                db,
+                request.app.state.settings,
+                email,
+                purpose,
+                user,
+                origin=getattr(request.state, "site_origin", None),
+            )
         service.audit(db, f"email.{purpose}_requested")
     return {"message": GENERIC_MESSAGE}
 
 
-def enqueue_link(db, settings, email, purpose, user=None):
+def enqueue_link(db, settings, email, purpose, user=None, origin=None):
     raw = token()
     expires = now() + timedelta(minutes=30)
     db.add(
@@ -45,7 +59,7 @@ def enqueue_link(db, settings, email, purpose, user=None):
             expires=expires,
         )
     )
-    link = f"{settings.public_origin}/#identity={purpose}&token={raw}"
+    link = f"{origin or settings.public_origin}/login#identity={purpose}&token={raw}"
     subject, introduction = {
         "signup": (
             "Create your Ive POS account",
@@ -82,6 +96,8 @@ def enqueue_link(db, settings, email, purpose, user=None):
 async def finish(request, raw, purpose, password=None, organization=None, code=""):
     require_email(request)
     await service.throttle(request, "email-complete", digest(raw))
+    if purpose == "signup" and request_tenant_id(request):
+        raise HTTPException(403, "Ask your organization administrator for an account")
     success = False
     async with request.app.state.db() as db, db.begin():
         initial = await db.get(EmailChallenge, digest(raw))
@@ -114,7 +130,7 @@ async def finish(request, raw, purpose, password=None, organization=None, code="
                     email_verified=True,
                     password_hash=await password_work(request, PASSWORD_HASHER.hash, password),
                 )
-                org = Organization(name=organization)
+                org = Organization(name=organization, slug=await allocate_slug(db, organization))
                 db.add_all([user, org])
                 await db.flush()
                 db.add(

@@ -1,11 +1,10 @@
-{$API_DOMAIN} {
-    reverse_proxy api-proxy:8000
+{
+    on_demand_tls {
+        ask http://api-proxy:8000/api/v1/public/domain-check
+    }
 }
 
-# Optional low-cost frontend on this same VM for real users.
-# For Pages demonstrations, point app.<domain> DNS at Pages instead.
-{$APP_DOMAIN} {
-    root * /srv
+(ive_frontend) {
     encode zstd gzip
     header {
         X-Content-Type-Options nosniff
@@ -13,6 +12,31 @@
         X-Frame-Options DENY
         Strict-Transport-Security "max-age=31536000"
     }
-    try_files {path} /index.html
-    file_server
+    handle /api/* {
+        reverse_proxy api-proxy:8000
+    }
+    handle {
+        root * /srv
+        try_files {path} {path}/index.html /index.html
+        file_server
+    }
+}
+
+{$API_DOMAIN} {
+    reverse_proxy api-proxy:8000
+}
+
+{$APP_DOMAIN} {
+    import ive_frontend
+}
+
+# Only registered organization addresses pass the certificate allowlist above.
+# Point *.ivepos.me at this proxy, and set TENANT_BASE_DOMAIN in the API.
+https:// {
+    tls {
+        on_demand
+    }
+    # Organization hosts are authentication workspaces, not public marketing pages.
+    header X-Robots-Tag "noindex, nofollow"
+    import ive_frontend
 }

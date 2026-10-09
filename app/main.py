@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from starlette.middleware.cors import CORSMiddleware
 
 from app.auth.identity_routes import router as identity_router
 from app.auth.invitations import router as invitations_router
@@ -19,9 +18,13 @@ from app.auth.service import require_auth
 from app.config import Settings
 from app.employees.routes import router as employees_router
 from app.operations.routes import router as operations_router
+from app.platform.billing import router as billing_router
 from app.platform.deletion import deletion_worker
 from app.platform.routes import router as platform_router
+from app.platform.staff import router as platform_staff_router
 from app.stores.routes import router as stores_router
+from app.tenancy.context import SiteContextMiddleware
+from app.tenancy.routes import router as site_router
 
 logger = logging.getLogger(__name__)
 
@@ -84,25 +87,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.add_middleware(SecurityMiddleware, settings_getter=lambda: app.state.settings)
 
-    # PUBLIC_ORIGIN is also the single allowed CSRF origin and email-link destination.
-    # Resolve during a request so importing the app never needs deployment secrets.
-    class ConfiguredCORS:
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
-                return await self.app(scope, receive, send)
-            cors = CORSMiddleware(
-                self.app,
-                allow_origins=[scope["app"].state.settings.public_origin],
-                allow_credentials=True,
-                allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-                allow_headers=["Content-Type", "X-POS-CSRF"],
-            )
-            await cors(scope, receive, send)
-
-    app.add_middleware(ConfiguredCORS)
+    app.add_middleware(SiteContextMiddleware)
+    app.include_router(site_router)
     app.include_router(router)
     app.include_router(identity_router)
     app.include_router(invitations_router)
@@ -110,6 +96,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(employees_router)
     app.include_router(operations_router)
     app.include_router(platform_router)
+    app.include_router(platform_staff_router)
+    app.include_router(billing_router)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_input(request: Request, exc: RequestValidationError):

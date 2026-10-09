@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -14,6 +15,7 @@ class Settings(BaseModel):
     auth_secret: SecretStr = Field(min_length=32)
     environment: Literal["development", "production"] = "production"
     public_origin: str = "https://localhost"
+    tenant_base_domain: str = ""
     geocoder_url: str = "https://nominatim.openstreetmap.org/search"
 
     identity_encryption_key: SecretStr | None = None
@@ -38,6 +40,19 @@ class Settings(BaseModel):
     def normalize_database_url(cls, value):
         raw = value.get_secret_value() if isinstance(value, SecretStr) else value
         return database_url(raw)
+
+    @field_validator("tenant_base_domain")
+    @classmethod
+    def validate_tenant_base_domain(cls, value):
+        value = value.strip().lower()
+        if value and not re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            value,
+        ):
+            raise ValueError("TENANT_BASE_DOMAIN must be a hostname")
+        if len(value) > 189:
+            raise ValueError("TENANT_BASE_DOMAIN is too long")
+        return value
 
     @property
     def email_enabled(self) -> bool:
@@ -131,6 +146,7 @@ class Settings(BaseModel):
             auth_secret=os.environ["AUTH_SECRET"],
             environment=os.environ.get("APP_ENV", "production"),
             public_origin=os.environ["PUBLIC_ORIGIN"],
+            tenant_base_domain=os.environ.get("TENANT_BASE_DOMAIN", ""),
             geocoder_url=os.environ.get(
                 "GEOCODER_URL", "https://nominatim.openstreetmap.org/search"
             ),

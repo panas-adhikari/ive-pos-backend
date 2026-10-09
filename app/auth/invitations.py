@@ -14,6 +14,7 @@ from app.auth.onboarding import require_email
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, token, verify_password
 from app.employees.routes import Access, Create, authorize, check_employee_limit, validate_grant
+from app.tenancy.service import organization_origin
 
 router = APIRouter(tags=["Onboarding"])
 
@@ -37,7 +38,8 @@ def deliver(db, request, invite, organization):
     invite.token_hash = digest(raw)
     invite.expires = now() + timedelta(minutes=30)
     invite.status = "pending"
-    link = f"{request.app.state.settings.public_origin}/#identity=invite&token={raw}"
+    origin = organization_origin(request.app.state.settings, organization.slug)
+    link = f"{origin}/login#identity=invite&token={raw}"
     queue_mail(
         db,
         request.app.state.settings,
@@ -115,8 +117,7 @@ async def manage(request, organization_id, db, platform, write=False):
     if write and (
         not actor.email_verified
         or not actor.mfa_secret
-        or not session.step_up_expires
-        or session.step_up_expires <= now()
+        or not service.action_verified(actor, session)
     ):
         raise HTTPException(403, "Unlock changes with your password and MFA code first")
     if not org:
