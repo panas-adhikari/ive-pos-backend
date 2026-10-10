@@ -101,7 +101,10 @@ class Settings(BaseModel):
             if not (
                 self.environment == "development"
                 and origin.scheme == "http"
-                and origin.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
+                and (
+                    origin.hostname in {"localhost", "127.0.0.1", "[::1]", "::1"}
+                    or origin.hostname.endswith(".localhost")
+                )
             ):
                 raise ValueError("HTTPS is required except for explicit localhost development")
         check_database_environment(
