@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 import time
 from datetime import timedelta
 from typing import Literal
@@ -19,11 +20,11 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 
 from app.auth import onboarding, service
 from app.auth.mail import queue_mail
-from app.auth.models import AuditEvent, Membership, Organization, Session, User
+from app.auth.models import AuditEvent, EmailChallenge, Membership, Organization, Session, User
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, verify_password
 from app.platform.deletion import purge_organization
@@ -61,6 +62,11 @@ class OrganizationSubdomain(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
     slug: str | None = Field(default=None, max_length=63)
+    expected_version: int = Field(ge=1)
+
+
+class OwnerPasswordReset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
 
 
@@ -401,6 +407,87 @@ async def email_owner_credentials(
             changes={"delivery": "email_outbox"},
         )
     return {"status": "queued"}
+
+
+@router.post("/organizations/{organization_id}/owner-password-reset")
+async def reset_owner_password(body: OwnerPasswordReset, organization_id: UUID, request: Request):
+    await service.require_platform_role(request, "super_admin")
+    await service.throttle(request, "platform-owner-password-reset", str(organization_id))
+    async with request.app.state.db() as db, db.begin():
+        actor, session = await service.locked_identity(request, db)
+        require_super_admin(actor)
+        require_step_up(actor, session)
+        organization = await db.scalar(
+            select(Organization).where(Organization.id == organization_id).with_for_update()
+        )
+        if not organization:
+            raise HTTPException(404, "Organization not found")
+        if organization.deletion_scheduled_for:
+            raise HTTPException(409, "This organization is scheduled for deletion")
+        if organization.version != body.expected_version:
+            raise HTTPException(409, "Organization changed. Refresh before resetting the password.")
+        owner = await db.scalar(
+            select(User).where(User.email == organization.contact_email).with_for_update()
+        )
+        membership = (
+            await db.scalar(
+                select(Membership)
+                .where(
+                    Membership.organization_id == organization.id,
+                    Membership.user_id == owner.id,
+                    Membership.active.is_(True),
+                )
+                .with_for_update()
+            )
+            if owner
+            else None
+        )
+        if (
+            not owner
+            or not owner.active
+            or not membership
+            or not (
+                "owner" in membership.roles
+                or membership.all_stores
+                and set(OWNER_PERMISSIONS).issubset(membership.permissions)
+            )
+        ):
+            raise HTTPException(409, "No active organization administrator matches this email.")
+        if owner.id == actor.id or owner.platform_role != "none":
+            raise HTTPException(409, "Platform accounts must use their own password recovery.")
+        temporary = secrets.token_urlsafe(24)
+        owner.password_hash = await password_work(request, PASSWORD_HASHER.hash, temporary)
+        owner.must_change_password = True
+        revoked = await db.execute(
+            update(Session)
+            .where(Session.user_id == owner.id, Session.revoked.is_(False))
+            .values(revoked=True)
+        )
+        await db.execute(
+            update(EmailChallenge)
+            .where(EmailChallenge.user_id == owner.id, EmailChallenge.purpose == "reset")
+            .values(used=True)
+        )
+        service.audit(
+            db,
+            "platform.owner_password_reset",
+            actor.id,
+            session.id,
+            organization_id=organization.id,
+            target_type="users",
+            target_id=owner.id,
+            changes={"must_change_password": True, "sessions_revoked": revoked.rowcount},
+        )
+        return {
+            "id": organization.id,
+            "organization": organization.name,
+            "email": owner.email,
+            "temporary_password": temporary,
+            "login_url": organization_origin(
+                request.app.state.settings, organization.slug, organization.subdomain_enabled
+            )
+            + "/login",
+        }
 
 
 @router.get("/organizations")
