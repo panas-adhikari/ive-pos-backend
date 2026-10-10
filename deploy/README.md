@@ -431,3 +431,30 @@ provide this API routing; the supplied Caddy deployment implements it.
 Provider references: [Vercel custom domains](https://vercel.com/docs/domains/working-with-domains/add-a-domain),
 [Vercel external rewrites](https://vercel.com/docs/routing/rewrites), and
 [Render pre-deploy commands](https://render.com/docs/deploys#pre-deploy-command).
+
+## Automatic Supabase migrations through GitHub Actions
+
+The backend workflow `.github/workflows/supabase-migrations.yml` runs on every
+push to `main` and can be started manually from Actions on `main`. Migration-related
+pull requests run only the disposable database validation job.
+
+Add a repository Actions secret named `SUPABASE_DATABASE_URL` under Settings →
+Secrets and variables → Actions. Use the same Supabase project as Render, with a
+direct or session-pooler PostgreSQL URL on port 5432 and `sslmode=require`. The URL
+needs permission to apply schema changes. Do not put it in workflow YAML or Vercel
+public environment variables. IPv4-only runners should use the session pooler.
+
+Before touching Supabase, the workflow migrates a fresh PostgreSQL 17 test database,
+checks the no-op path, and runs deployment, database-transfer, and tenant tests.
+After validation succeeds, the production job compares Supabase's revision to the checked-out migration head,
+applies pending forward migrations, and verifies the final revision. It fails on
+unknown/divergent history, missing secrets, or an unsuccessful upgrade. Current
+databases are left unchanged. Production migration jobs are serialized and active
+upgrades are not canceled by newer pushes.
+
+Merge this workflow into `main` to enable it. This workflow does not deploy Render
+or wait for Render automatic deploys. If Render auto-deploys the same push, it can
+start before the migration finishes: deploy it after this workflow succeeds. Choose
+one migration runner; remove the Render pre-deploy migration command when GitHub
+Actions owns migrations. Keep Supabase backups configured independently. GitHub
+Actions never copies local development records to Supabase.

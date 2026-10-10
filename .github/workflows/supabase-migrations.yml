@@ -1,0 +1,86 @@
+name: Supabase migrations
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'migrations/**'
+      - 'app/**'
+      - 'alembic.ini'
+      - 'requirements*.txt'
+      - '.github/workflows/supabase-migrations.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate migrations on disposable PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: ive_migration_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: disposable-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test -d ive_migration_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APP_ENV: development
+      DB_PROVIDER: postgres
+      DATABASE_URL: postgresql://test:disposable-ci-only@127.0.0.1:5432/ive_migration_test
+      AUTH_TEST_DATABASE_URL: postgresql://test:disposable-ci-only@127.0.0.1:5432/ive_migration_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Apply migrations to a fresh database
+        run: python -m app.migrate
+      - name: Verify an up-to-date database needs no migrations
+        run: python -m app.migrate
+      - name: Run migration and tenant integration tests
+        run: pytest -q tests/test_deployment.py tests/test_platform_migration.py tests/test_tenancy.py
+
+  migrate:
+    name: Check and migrate Supabase
+    needs: validate
+    # Serialize production upgrades without letting PR checks interrupt them.
+    concurrency:
+      group: supabase-production-migrations
+      cancel-in-progress: false
+    # PRs and manual runs from feature branches cannot migrate production.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: production
+      DB_PROVIDER: supabase
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check revision and apply pending forward migrations
+        env:
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          if [ -z "$SUPABASE_DATABASE_URL" ]; then
+            echo "Missing GitHub Actions secret SUPABASE_DATABASE_URL."
+            exit 1
+          fi
+          python -m app.migrate
