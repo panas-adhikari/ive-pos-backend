@@ -50,7 +50,7 @@ jobs:
       - name: Verify an up-to-date database needs no migrations
         run: python -m app.migrate
       - name: Run migration and tenant integration tests
-        run: pytest -q tests/test_deployment.py tests/test_platform_migration.py tests/test_tenancy.py
+        run: pytest -q tests/test_deployment.py tests/test_platform_migration.py tests/test_tenancy.py tests/test_owner_password_reset.py
 
   migrate:
     name: Check and migrate Supabase

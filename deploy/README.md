@@ -442,6 +442,19 @@ Provider references: [Vercel custom domains](https://vercel.com/docs/domains/wor
 [Vercel external rewrites](https://vercel.com/docs/routing/rewrites), and
 [Render pre-deploy commands](https://render.com/docs/deploys#pre-deploy-command).
 
+## Organization administrator password recovery
+
+Organization administrator recovery is available in Platform → Organizations →
+organization details → Platform controls → Reset administrator password. A
+verified platform super admin can generate a temporary password without accessing
+the database. It revokes all of the account's sessions, invalidates old reset
+links, preserves MFA, and requires the administrator to change the password on
+next login. The password is returned only by the reset action and is not stored
+as plaintext or included in the audit event. Copy/share it before closing the
+dialog; optional email delivery uses the existing mail worker. Inactive,
+unrelated, non-administrator, and platform accounts cannot be reset this way.
+Deploy both API and frontend for this feature; no additional migration is needed.
+
 ## Automatic Supabase migrations through GitHub Actions
 
 The backend workflow `.github/workflows/supabase-migrations.yml` runs on every
