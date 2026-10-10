@@ -33,7 +33,9 @@ class SiteContextMiddleware:
         if slug:
             async with scope["app"].state.db() as db:
                 organization = await db.scalar(
-                    select(Organization).where(Organization.slug == slug)
+                    select(Organization).where(
+                        Organization.slug == slug, Organization.subdomain_enabled.is_(True)
+                    )
                 )
             if organization is None:
                 return await JSONResponse(

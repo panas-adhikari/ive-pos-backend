@@ -48,6 +48,7 @@ class Organization(Base):
     __tablename__ = "organizations"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
     slug: Mapped[str] = mapped_column(String(63), unique=True, default=lambda: f"org-{uuid7().hex}")
+    subdomain_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(160))
     contact_email: Mapped[str] = mapped_column(String(254), default="")
     phone: Mapped[str] = mapped_column(String(40), default="")

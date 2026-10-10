@@ -47,17 +47,56 @@ def suggested_slug(name):
     return f"{base}-store" if base in RESERVED_SLUGS else base
 
 
-async def allocate_slug(db, name, requested=None):
+def name_words(name):
+    plain = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return re.findall(r"[a-z0-9]+", plain)
+
+
+def validate_name_slug(name, value):
+    value = validate_slug(value)
+    words = name_words(name)
+    initials = "".join(word[0] for word in words)
+    if value in words or (
+        len(value) >= 2 and (value == initials or any(word.startswith(value) for word in words))
+    ):
+        return value
+    raise ValueError(
+        "Choose a word from the organization name, "
+        "a prefix of at least two letters, or its initials."
+    )
+
+
+def subdomain_suggestions(name):
+    words = name_words(name)
+    candidates = words + [word[:3] for word in words if len(word) > 3]
+    if len(words) > 1:
+        candidates.append("".join(word[0] for word in words))
+    return list(
+        dict.fromkeys(
+            value
+            for value in candidates
+            if SLUG_PATTERN.fullmatch(value) and value not in RESERVED_SLUGS
+        )
+    )
+
+
+async def allocate_slug(db, name, requested=None, exclude_id=None):
     # Serialize allocation, including collisions between a generated and a requested slug.
     await db.execute(text("SELECT pg_advisory_xact_lock(736192801)"))
     base = validate_slug(requested) if requested else suggested_slug(name)
     candidate, suffix = base, 1
-    while await db.scalar(select(Organization.id).where(Organization.slug == candidate)):
+    query = select(Organization.id).where(Organization.slug == candidate)
+    if exclude_id is not None:
+        query = query.where(Organization.id != exclude_id)
+    while await db.scalar(query):
         if requested:
             raise HTTPException(409, "This sign-in address is taken. Choose another.")
         suffix += 1
         ending = f"-{suffix}"
         candidate = f"{base[: 63 - len(ending)].rstrip('-')}{ending}"
+        query = select(Organization.id).where(Organization.slug == candidate)
+        if exclude_id is not None:
+            query = query.where(Organization.id != exclude_id)
     return candidate
 
 
@@ -90,8 +129,8 @@ def tenant_slug(settings, origin):
         return None
 
 
-def organization_origin(settings, slug):
-    if not settings.tenant_base_domain:
+def organization_origin(settings, slug, enabled=True):
+    if not enabled or not settings.tenant_base_domain:
         return settings.public_origin
     public = urlsplit(settings.public_origin)
     port = f":{public.port}" if public.port else ""

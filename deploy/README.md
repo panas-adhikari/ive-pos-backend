@@ -409,7 +409,7 @@ authentication and identity encryption secrets stable.
 Run `alembic upgrade head` as the Render API pre-deploy command where supported,
 with the same environment as the API. Otherwise run it as a separate release step
 before deploying code that needs new columns. The current repository head is
-`8a9b0c1d2e3f`; verify the deployed database's `alembic_version`. Applying migrations
+`9b0c1d2e3f4a`; verify the deployed database's `alembic_version`. Applying migrations
 does not copy local organizations or switch the running service's database provider.
 
 On Vercel, build with `npm run build` and publish `dist`. Set
@@ -417,7 +417,17 @@ On Vercel, build with `npm run build` and publish `dist`. Set
 `VITE_PUBLIC_SITE_URL=https://www.ivepos.me`, `VITE_TENANT_BASE_DOMAIN=ivepos.me`,
 and `VITE_API_URL` to the exact HTTPS Render API origin or its API custom domain.
 Add `www.ivepos.me` and `app.ivepos.me` to the appropriate frontend project(s).
-Automatic organization addresses require wildcard domain/DNS/certificate routing.
+Organization addresses require wildcard domain/DNS/certificate routing.
+
+New organizations start with platform sign-in. In Platform → Organizations, open
+the organization and use the separate Subdomain form to enable a dedicated address.
+Choose a word from its name, a prefix of at least two characters, or its initials
+(for example, Atharva Organization can use `atharva`, `ath`, or `ao`). Reserved or
+taken addresses are rejected. Changing or disabling an address requires platform
+super-admin verification and is audited; previous links stop working after a change.
+The optional-subdomain migration preserves existing addresses, including legacy
+multiword slugs, and defaults future organizations to platform sign-in. Apply it
+before deploying this backend/frontend change. It does not configure DNS or routing.
 
 Organization hosts deliberately call their own `/api` path to keep cookies host-only.
 Their frontend host must proxy these requests to Render and preserve the original

@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import (
@@ -28,7 +28,13 @@ from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, verify_password
 from app.platform.deletion import purge_organization
 from app.stores.routes import CURRENCIES, TIMEZONES
-from app.tenancy.service import allocate_slug, organization_origin, validate_slug
+from app.tenancy.service import (
+    allocate_slug,
+    organization_origin,
+    subdomain_suggestions,
+    validate_name_slug,
+    validate_slug,
+)
 
 router = APIRouter(prefix="/api/v1/platform", tags=["Platform control"])
 _geocoder_lock = asyncio.Lock()
@@ -51,6 +57,13 @@ class OrganizationLimits(BaseModel):
     employee_limit: int = Field(ge=1, le=100_000)
 
 
+class OrganizationSubdomain(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+    slug: str | None = Field(default=None, max_length=63)
+    expected_version: int = Field(ge=1)
+
+
 class OrganizationInvite(BaseModel):
     model_config = ConfigDict(extra="forbid")
     slug: str | None = Field(default=None, max_length=63)
@@ -59,6 +72,12 @@ class OrganizationInvite(BaseModel):
     @classmethod
     def valid_slug(cls, value):
         return validate_slug(value) if value else None
+
+    @model_validator(mode="after")
+    def name_based_subdomain(self):
+        if self.slug:
+            self.slug = validate_name_slug(self.name, self.slug)
+        return self
 
     name: str = Field(min_length=1, max_length=160)
     owner_email: EmailStr = Field(max_length=254)
@@ -253,7 +272,10 @@ async def invite_organization(body: OrganizationInvite, request: Request):
             )
         organization = Organization(
             name=body.name,
-            slug=await allocate_slug(db, body.name, body.slug),
+            slug=await allocate_slug(db, body.name, body.slug)
+            if body.slug
+            else f"org-{uuid4().hex}",
+            subdomain_enabled=bool(body.slug),
             contact_email=owner_email,
             phone=body.owner_phone or body.phone or "",
             organization_type=body.organization_type,
@@ -311,8 +333,11 @@ async def invite_organization(body: OrganizationInvite, request: Request):
             "id": organization.id,
             "name": organization.name,
             "configured": False,
-            "slug": organization.slug,
-            "login_url": organization_origin(request.app.state.settings, organization.slug)
+            "slug": organization.slug if organization.subdomain_enabled else None,
+            "subdomain_enabled": organization.subdomain_enabled,
+            "login_url": organization_origin(
+                request.app.state.settings, organization.slug, organization.subdomain_enabled
+            )
             + "/login",
         }
 
@@ -343,7 +368,12 @@ async def email_owner_credentials(
             or not await password_work(request, verify_password, owner.password_hash, password)
         ):
             raise HTTPException(400, "Temporary sign-in details are no longer valid")
-        login_url = organization_origin(request.app.state.settings, organization.slug) + "/login"
+        login_url = (
+            organization_origin(
+                request.app.state.settings, organization.slug, organization.subdomain_enabled
+            )
+            + "/login"
+        )
         queue_mail(
             db,
             request.app.state.settings,
@@ -394,8 +424,11 @@ async def organizations(request: Request):
                 "name": organization.name,
                 "organization_type": organization.organization_type,
                 "image_url": organization.image_url,
-                "slug": organization.slug,
-                "login_url": organization_origin(request.app.state.settings, organization.slug)
+                "slug": organization.slug if organization.subdomain_enabled else None,
+                "subdomain_enabled": organization.subdomain_enabled,
+                "login_url": organization_origin(
+                    request.app.state.settings, organization.slug, organization.subdomain_enabled
+                )
                 + "/login",
                 "location_label": organization.location_label,
                 "configured": organization.configured,
@@ -446,8 +479,11 @@ async def organization_detail(organization_id: UUID, request: Request):
             "name": organization.name,
             "organization_type": organization.organization_type,
             "image_url": organization.image_url,
-            "slug": organization.slug,
-            "login_url": organization_origin(request.app.state.settings, organization.slug)
+            "slug": organization.slug if organization.subdomain_enabled else None,
+            "subdomain_enabled": organization.subdomain_enabled,
+            "login_url": organization_origin(
+                request.app.state.settings, organization.slug, organization.subdomain_enabled
+            )
             + "/login",
             "website_url": organization.website_url,
             "location_label": organization.location_label,
@@ -477,6 +513,83 @@ async def organization_detail(organization_id: UUID, request: Request):
                 for row in limit_requests
                 if (row.changes or {}).get("requested_limit", 0) > organization.store_limit
             ],
+        }
+
+
+@router.get("/organizations/{organization_id}/subdomain-options")
+async def subdomain_options(organization_id: UUID, request: Request):
+    await service.require_platform_role(request, "super_admin", "employee")
+    async with request.app.state.db() as db:
+        organization = await db.get(Organization, organization_id)
+        if not organization:
+            raise HTTPException(404, "Organization not found")
+        suggestions = subdomain_suggestions(organization.name)
+        taken = set(
+            await db.scalars(
+                select(Organization.slug).where(
+                    Organization.slug.in_(suggestions), Organization.id != organization.id
+                )
+            )
+        )
+        return {
+            "domain": request.app.state.settings.tenant_base_domain,
+            "suggestions": [{"slug": slug, "available": slug not in taken} for slug in suggestions],
+        }
+
+
+@router.put("/organizations/{organization_id}/subdomain")
+async def configure_subdomain(body: OrganizationSubdomain, organization_id: UUID, request: Request):
+    async with request.app.state.db() as db, db.begin():
+        actor, session = await service.locked_identity(request, db)
+        require_super_admin(actor)
+        require_step_up(actor, session)
+        # Match the allocator's lock order before locking an organization row.
+        await db.execute(text("SELECT pg_advisory_xact_lock(736192801)"))
+        organization = await db.scalar(
+            select(Organization).where(Organization.id == organization_id).with_for_update()
+        )
+        if not organization:
+            raise HTTPException(404, "Organization not found")
+        if organization.deletion_scheduled_for:
+            raise HTTPException(409, "This organization is scheduled for deletion")
+        if organization.version != body.expected_version:
+            raise HTTPException(409, "Organization changed. Refresh before saving the subdomain.")
+        before = {"enabled": organization.subdomain_enabled, "slug": organization.slug}
+        if body.enabled:
+            if not request.app.state.settings.tenant_base_domain:
+                raise HTTPException(
+                    503, "Organization subdomain sign-in is not configured on this platform."
+                )
+            try:
+                slug = validate_name_slug(organization.name, body.slug or "")
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            organization.slug = await allocate_slug(
+                db, organization.name, slug, exclude_id=organization.id
+            )
+        organization.subdomain_enabled = body.enabled
+        organization.version += 1
+        service.audit(
+            db,
+            "platform.organization_subdomain_updated",
+            actor.id,
+            session.id,
+            organization_id=organization.id,
+            target_type="organizations",
+            target_id=organization.id,
+            changes={
+                "before": before,
+                "after": {"enabled": body.enabled, "slug": organization.slug},
+            },
+        )
+        return {
+            "subdomain_enabled": organization.subdomain_enabled,
+            "slug": organization.slug if organization.subdomain_enabled else None,
+            "version": organization.version,
+            "login_url": organization_origin(
+                request.app.state.settings, organization.slug, organization.subdomain_enabled
+            )
+            + "/login",
         }
 
 

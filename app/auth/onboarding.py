@@ -9,7 +9,7 @@ from app.auth.mail import queue_mail
 from app.auth.models import EmailChallenge, Membership, Organization, Session, User
 from app.auth.permissions import OWNER_PERMISSIONS
 from app.auth.security import PASSWORD_HASHER, digest, now, password_work, token
-from app.tenancy.service import allocate_slug, request_tenant_id, tenant_membership
+from app.tenancy.service import request_tenant_id, tenant_membership
 
 GENERIC_MESSAGE = "If this address is eligible, an email will arrive shortly."
 
@@ -130,7 +130,7 @@ async def finish(request, raw, purpose, password=None, organization=None, code="
                     email_verified=True,
                     password_hash=await password_work(request, PASSWORD_HASHER.hash, password),
                 )
-                org = Organization(name=organization, slug=await allocate_slug(db, organization))
+                org = Organization(name=organization)
                 db.add_all([user, org])
                 await db.flush()
                 db.add(
