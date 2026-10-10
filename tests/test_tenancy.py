@@ -186,7 +186,9 @@ async def test_tenant_recovery_links_and_signup_restriction(tenants):
             outbox = await db.scalar(select(MailOutbox).order_by(MailOutbox.created.desc()))
             body = cipher(app.state.settings).decrypt(outbox.payload.encode()).decode()
             assert "https://alpha.example.test/login#identity=reset" in body
-        assert await latest_link(app, "owner0@example.com", "reset")
+        assert await latest_link(
+            app, "owner0@example.com", "reset", expected_origin="https://alpha.example.test"
+        )
 
 
 @pytest.mark.anyio
@@ -244,3 +246,46 @@ async def test_slug_allocation_and_platform_onboarding(owner):
     )
     assert response.status_code == 201
     assert urlsplit(response.json()["login_url"]).hostname == "mountain-shop-2.example.test"
+
+
+@pytest.mark.anyio
+async def test_localhost_subdomain_branding_login_and_isolation(tenants):
+    app, _, ids = tenants
+    settings = app.state.settings
+    settings.environment = "development"
+    settings.public_origin = "http://app.localhost:5173"
+    settings.tenant_base_domain = "localhost"
+    origin = "http://alpha.localhost:5173"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=origin,
+        headers={"Origin": origin, "X-POS-CSRF": "1"},
+    ) as alpha:
+        brand = (await alpha.get("/api/v1/public/site")).json()["organization"]
+        assert brand["id"] == ids[0]
+        assert brand["login_url"] == origin + "/login"
+        response = await alpha.post(
+            "/api/v1/auth/login",
+            json={"email": "owner0@example.com", "password": PASSWORD},
+        )
+        assert response.status_code == 204
+        for cookie in response.headers.get_list("set-cookie"):
+            assert "Domain=" not in cookie
+            assert "pos_dev_" in cookie
+        me = (await alpha.get("/api/v1/auth/me")).json()
+        assert [m["organization_id"] for m in me["memberships"]] == [ids[0]]
+        assert (
+            await alpha.post(
+                "/api/v1/auth/logout",
+                json={},
+                headers={"Origin": "http://beta.localhost:5173"},
+            )
+        ).status_code == 403
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://beta.localhost:5173",
+        ) as beta:
+            cookies = "; ".join(f"{key}={value}" for key, value in alpha.cookies.items())
+            assert (
+                await beta.get("/api/v1/auth/me", headers={"Cookie": cookies})
+            ).status_code == 401

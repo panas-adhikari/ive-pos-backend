@@ -98,12 +98,20 @@ def test_supabase_settings_and_migrations_select_same_uri(monkeypatch):
         require_test_database(hosted)
 
 
-def test_cross_subdomain_cors_and_csrf():
-    origin = "https://app.example.com"
+@pytest.mark.parametrize(
+    "origin, environment",
+    [
+        ("https://app.example.com", "production"),
+        ("http://app.localhost:5173", "development"),
+    ],
+)
+def test_cross_subdomain_cors_and_csrf(origin, environment):
     settings = Settings(
         database_url="postgresql://test:test@localhost/unused_test",
         auth_secret="test-only-secret-that-is-at-least-32-characters",
         public_origin=origin,
+        environment=environment,
+        tenant_base_domain="localhost" if environment == "development" else "",
         run_deletion_worker=False,
     )
     with TestClient(create_app(settings), base_url="https://api.example.com") as client:
@@ -197,3 +205,32 @@ def test_example_auth_secret_is_not_accepted():
             database_url="postgresql://test:test@localhost/test",
             auth_secret="REPLACE_WITH_AT_LEAST_48_RANDOM_CHARACTERS",
         )
+
+
+@pytest.mark.parametrize(
+    "origin, environment, accepted",
+    [
+        ("http://app.localhost:5173", "development", True),
+        ("http://www.localhost:5173", "development", True),
+        ("http://app.localhost:5173", "production", False),
+        ("http://app.localhost.example.com:5173", "development", False),
+        ("http://notlocalhost:5173", "development", False),
+        ("http://app.example.com:5173", "development", False),
+    ],
+)
+def test_local_subdomain_http_is_development_only(origin, environment, accepted):
+    from pydantic import ValidationError
+
+    values = dict(
+        database_url="postgresql://test:test@localhost/unused_test",
+        auth_secret="test-only-secret-that-is-at-least-32-characters",
+        public_origin=origin,
+        environment=environment,
+    )
+    if accepted:
+        settings = Settings(**values)
+        assert not settings.secure_cookies
+        assert settings.cookie_name("access") == "pos_dev_access"
+    else:
+        with pytest.raises(ValidationError, match="HTTPS is required"):
+            Settings(**values)

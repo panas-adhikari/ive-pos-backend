@@ -418,7 +418,7 @@ async def test_password_change_racing_another_session_refresh_revokes_both(setup
         assert (await other.post("/api/v1/auth/refresh", json={})).status_code == 401
 
 
-async def latest_link(app, email, purpose):
+async def latest_link(app, email, purpose, expected_origin=ORIGIN):
     import json
     from urllib.parse import parse_qs, urlsplit
 
@@ -431,7 +431,9 @@ async def latest_link(app, email, purpose):
             payload = json.loads(cipher(app.state.settings).decrypt(row.payload.encode()))
             if payload["email"] == email and "#identity=" + purpose in payload["body"]:
                 link = payload["body"].split("\n\n")[1]
-                assert link.startswith(ORIGIN + "/#") or link.startswith(ORIGIN + "/login#")
+                assert link.startswith(expected_origin + "/#") or link.startswith(
+                    expected_origin + "/login#"
+                )
                 return parse_qs(urlsplit(link).fragment)["token"][0]
     raise AssertionError("No matching email")
 

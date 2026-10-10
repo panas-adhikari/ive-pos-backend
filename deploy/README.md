@@ -18,9 +18,12 @@ npm run dev -- --port 5173 --strictPort
 ```
 
 Vite discovers the loopback API port and proxies `/api`; leave VITE_API_URL blank locally.
-For direct cross-origin development, use VITE_API_URL=http://localhost:8000 and
-PUBLIC_ORIGIN=http://localhost:5173. Use the **same hostname** on each side, not localhost
-on one and 127.0.0.1 on the other. Cookies are host-only, so different loopback hosts differ.
+Open `http://www.localhost:5173` for marketing and `http://app.localhost:5173/login`
+for sign-in. Set `PUBLIC_ORIGIN=http://app.localhost:5173` and
+`TENANT_BASE_DOMAIN=localhost` in the backend environment. Registered organizations use
+`http://<slug>.localhost:5173/login`. The workspace-root Compose identity environment
+must forward `TENANT_BASE_DOMAIN` to the API, migration process, and mail worker.
+Cookies are host-only, so different loopback hosts have separate sessions.
 No secrets go in VITE_*; they are embedded in public JavaScript.
 
 Local Compose includes a one-shot migration process and a separate mail-worker.
@@ -394,3 +397,37 @@ Reference behavior: [Docker external volumes](https://docs.docker.com/reference/
 [Pages workflows](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages),
 [Heroku containers](https://devcenter.heroku.com/articles/container-registry-and-runtime),
 [restic retention](https://github.com/restic/restic/blob/master/doc/060_forget.rst).
+
+## Vercel frontend and Render API
+
+For the Render API and mail worker, use `APP_ENV=production`,
+`PUBLIC_ORIGIN=https://app.ivepos.me`, `TENANT_BASE_DOMAIN=ivepos.me`,
+`DB_PROVIDER=supabase`, and the existing secret `SUPABASE_DATABASE_URL` using the
+direct connection or session pooler on port 5432 with `sslmode=require`. Keep the
+authentication and identity encryption secrets stable.
+
+Run `alembic upgrade head` as the Render API pre-deploy command where supported,
+with the same environment as the API. Otherwise run it as a separate release step
+before deploying code that needs new columns. The current repository head is
+`8a9b0c1d2e3f`; verify the deployed database's `alembic_version`. Applying migrations
+does not copy local organizations or switch the running service's database provider.
+
+On Vercel, build with `npm run build` and publish `dist`. Set
+`VITE_APP_LOGIN_URL=https://app.ivepos.me/login`,
+`VITE_PUBLIC_SITE_URL=https://www.ivepos.me`, `VITE_TENANT_BASE_DOMAIN=ivepos.me`,
+and `VITE_API_URL` to the exact HTTPS Render API origin or its API custom domain.
+Add `www.ivepos.me` and `app.ivepos.me` to the appropriate frontend project(s).
+Automatic organization addresses require wildcard domain/DNS/certificate routing.
+
+Organization hosts deliberately call their own `/api` path to keep cookies host-only.
+Their frontend host must proxy these requests to Render and preserve the original
+organization Host and HTTPS scheme, or use an explicitly authenticated tenant-aware
+proxy integration. An external rewrite must be verified with a same-origin GET to
+`https://<slug>.ivepos.me/api/v1/public/site` without an Origin header: it must return
+that organization rather than the platform or HTML. The backend does not trust
+arbitrary `X-Forwarded-Host` headers. Wildcard DNS and `VITE_API_URL` alone do not
+provide this API routing; the supplied Caddy deployment implements it.
+
+Provider references: [Vercel custom domains](https://vercel.com/docs/domains/working-with-domains/add-a-domain),
+[Vercel external rewrites](https://vercel.com/docs/routing/rewrites), and
+[Render pre-deploy commands](https://render.com/docs/deploys#pre-deploy-command).

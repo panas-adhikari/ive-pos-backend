@@ -129,7 +129,8 @@ fi
 
 export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}}"
 export APP_ENV="${APP_ENV:-development}"
-export PUBLIC_ORIGIN="${PUBLIC_ORIGIN:-http://localhost:5173}"
+export PUBLIC_ORIGIN="${PUBLIC_ORIGIN:-http://app.localhost:5173}"
+export TENANT_BASE_DOMAIN="${TENANT_BASE_DOMAIN:-localhost}"
 
 if [[ -z "$DATABASE_URL_WAS_SET" ]] && ! command -v psql >/dev/null 2>&1; then
   printf 'PostgreSQL client tools are required for local mode (psql was not found).\n' >&2
