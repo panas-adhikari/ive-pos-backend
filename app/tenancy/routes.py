@@ -34,6 +34,10 @@ async def domain_check(request: Request, domain: str = Query(max_length=253)):
     if not slug:
         raise HTTPException(403, "Domain not registered")
     async with request.app.state.db() as db:
-        if not await db.scalar(select(Organization.id).where(Organization.slug == slug)):
+        if not await db.scalar(
+            select(Organization.id).where(
+                Organization.slug == slug, Organization.subdomain_enabled.is_(True)
+            )
+        ):
             raise HTTPException(403, "Domain not registered")
     return Response(status_code=204)

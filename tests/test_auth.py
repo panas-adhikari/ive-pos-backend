@@ -646,6 +646,7 @@ async def test_mfa_confirmation_replaces_browser_session_and_revokes_older_sessi
                 select(Organization).where(Organization.name == "Store 0")
             )
             organization.slug = "alpha"
+            organization.subdomain_enabled = True
             tenant_id = organization.id
         origin = "https://alpha.example.test"
         client.base_url = origin

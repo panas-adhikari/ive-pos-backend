@@ -1,12 +1,18 @@
-from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 import pytest
 from sqlalchemy import select
 
-from app.auth.models import Membership, Organization, Session, User
-from app.tenancy.service import allocate_slug, suggested_slug, tenant_slug, validate_slug
+from app.auth.models import AuditEvent, Membership, Organization, Session, User
+from app.tenancy.service import (
+    allocate_slug,
+    subdomain_suggestions,
+    suggested_slug,
+    tenant_slug,
+    validate_name_slug,
+    validate_slug,
+)
 from tests.test_auth import HEADERS, PASSWORD
 from tests.test_auth import anyio_backend as anyio_backend
 from tests.test_auth import setup as setup
@@ -34,6 +40,7 @@ async def tenants(setup):
     async with app.state.db() as db, db.begin():
         orgs = list(await db.scalars(select(Organization).order_by(Organization.name)))
         orgs[0].slug, orgs[1].slug = "alpha", "beta"
+        orgs[0].subdomain_enabled = orgs[1].subdomain_enabled = True
         orgs[0].image_url = "https://images.example.test/alpha.png"
         ids = [str(org.id) for org in orgs]
     return app, client, ids
@@ -210,7 +217,7 @@ async def test_slug_allocation_and_platform_onboarding(owner):
     ).status_code == 200
     payload = {
         "name": "Mountain Shop",
-        "slug": "mountain-shop",
+        "slug": "mountain",
         "owner_email": "mountain@example.com",
         "owner_name": "Shop Owner",
         "owner_temporary_password": PASSWORD,
@@ -218,7 +225,7 @@ async def test_slug_allocation_and_platform_onboarding(owner):
     }
     response = await client.post("/api/v1/platform/organizations", json=payload)
     assert response.status_code == 201, response.text
-    assert response.json()["login_url"] == "https://mountain-shop.example.test/login"
+    assert response.json()["login_url"] == "https://mountain.example.test/login"
     response = await client.post(
         "/api/v1/platform/organizations",
         json={
@@ -245,7 +252,9 @@ async def test_slug_allocation_and_platform_onboarding(owner):
         },
     )
     assert response.status_code == 201
-    assert urlsplit(response.json()["login_url"]).hostname == "mountain-shop-2.example.test"
+    assert response.json()["slug"] is None
+    assert response.json()["subdomain_enabled"] is False
+    assert response.json()["login_url"] == app.state.settings.public_origin + "/login"
 
 
 @pytest.mark.anyio
@@ -289,3 +298,105 @@ async def test_localhost_subdomain_branding_login_and_isolation(tenants):
             assert (
                 await beta.get("/api/v1/auth/me", headers={"Cookie": cookies})
             ).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "name, slug",
+    [
+        ("Atharva Organization", "atharva"),
+        ("Atharva Organization", "org"),
+        ("Atharva Organization", "ao"),
+        ("Margret Crimson", "mc"),
+        ("Café & Groceries", "cafe"),
+        ("A Store", "a"),
+    ],
+)
+def test_subdomain_uses_name_words_and_short_forms(name, slug):
+    assert validate_name_slug(name, slug.upper()) == slug
+
+
+@pytest.mark.parametrize("slug", ["unrelated", "atharva-organization", "a", "org-2", "app"])
+def test_unrelated_or_multiword_subdomains_are_rejected(slug):
+    with pytest.raises(ValueError):
+        validate_name_slug("Atharva Organization", slug)
+
+
+def test_name_subdomain_suggestions():
+    assert subdomain_suggestions("Atharva Organization") == [
+        "atharva",
+        "organization",
+        "ath",
+        "org",
+        "ao",
+    ]
+    assert "api" not in subdomain_suggestions("API Store")
+
+
+@pytest.mark.anyio
+async def test_optional_subdomain_setup_validation_and_disabling(owner):
+    app, client, base = owner
+    org_id = UUID(base.rsplit("/", 1)[1])
+    app.state.settings.tenant_base_domain = "example.test"
+    async with app.state.db() as db, db.begin():
+        actor = await db.scalar(select(User).where(User.email == "owner0@example.com"))
+        actor.platform_role = "super_admin"
+        org = await db.get(Organization, org_id)
+        org.name = "Atharva Organization"
+        other = await db.scalar(select(Organization).where(Organization.id != org_id))
+        other.slug = "organization"
+        other.subdomain_enabled = True
+    path = f"/api/v1/platform/organizations/{org_id}"
+    detail = (await client.get(path)).json()
+    assert detail["subdomain_enabled"] is False
+    assert detail["slug"] is None
+    assert detail["login_url"] == app.state.settings.public_origin + "/login"
+    options = (await client.get(path + "/subdomain-options")).json()
+    assert options["domain"] == "example.test"
+    assert {item["slug"]: item["available"] for item in options["suggestions"]}[
+        "organization"
+    ] is False
+    body = {"enabled": True, "slug": "ath", "expected_version": detail["version"]}
+    assert (await client.put(path + "/subdomain", json=body)).status_code == 403
+    assert (
+        await client.post("/api/v1/auth/step-up", json={"password": PASSWORD, "code": CODES[1]})
+    ).status_code == 200
+    for invalid in ("atharva-organization", "unrelated", "a", "app"):
+        assert (
+            await client.put(path + "/subdomain", json={**body, "slug": invalid})
+        ).status_code == 422
+    assert (
+        await client.put(path + "/subdomain", json={**body, "slug": "organization"})
+    ).status_code == 409
+    response = await client.put(path + "/subdomain", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["login_url"] == "https://ath.example.test/login"
+    assert result["subdomain_enabled"] is True
+    assert (await client.put(path + "/subdomain", json=body)).status_code == 409
+    async with tenant_client(app, "ath") as tenant:
+        assert (await tenant.get("/api/v1/public/site")).json()["organization"]["id"] == str(org_id)
+    # Re-saving an organization's own slug must not be treated as a collision.
+    response = await client.put(
+        path + "/subdomain", json={**body, "expected_version": result["version"]}
+    )
+    assert response.status_code == 200
+    response = await client.put(
+        path + "/subdomain", json={"enabled": False, "expected_version": response.json()["version"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["slug"] is None
+    assert response.json()["login_url"] == app.state.settings.public_origin + "/login"
+    async with tenant_client(app, "ath") as tenant:
+        assert (await tenant.get("/api/v1/public/site")).status_code == 404
+    assert (
+        await client.get("/api/v1/public/domain-check", params={"domain": "ath.example.test"})
+    ).status_code == 403
+    async with app.state.db() as db:
+        events = list(
+            await db.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "platform.organization_subdomain_updated"
+                )
+            )
+        )
+        assert len(events) == 3

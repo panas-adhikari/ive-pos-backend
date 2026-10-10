@@ -38,7 +38,9 @@ def deliver(db, request, invite, organization):
     invite.token_hash = digest(raw)
     invite.expires = now() + timedelta(minutes=30)
     invite.status = "pending"
-    origin = organization_origin(request.app.state.settings, organization.slug)
+    origin = organization_origin(
+        request.app.state.settings, organization.slug, organization.subdomain_enabled
+    )
     link = f"{origin}/login#identity=invite&token={raw}"
     queue_mail(
         db,
